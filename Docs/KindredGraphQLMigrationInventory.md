@@ -1,6 +1,6 @@
 # Kindred GraphQL Migration Inventory
 
-Source inspected: `/Users/marlonjd/Developer/mobile/kindred_swift/kindred_mobile`.
+Source inspected: Kindred iOS app checkout at `kindred_mobile`.
 
 ## Previous Generated-Client Footprint
 

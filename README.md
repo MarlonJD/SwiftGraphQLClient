@@ -66,13 +66,13 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 
 ## Kindred Migration Notes
 
-See [KindredGraphQLMigrationInventory.md](/Users/marlonjd/Developer/desktop/asdfawef/Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory and narrowed MVP order.
+See [KindredGraphQLMigrationInventory.md](Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory and narrowed MVP order.
 
 Kindred smoke-test command used during development:
 
 ```sh
 swift run swift-graphql generate \
-  --config /Users/marlonjd/Developer/mobile/kindred_swift/kindred_mobile/swift-graphql-codegen.yml \
+  --config /path/to/kindred_mobile/swift-graphql-codegen.yml \
   --output /private/tmp/kindred-swift-graphql-generated-typed
 ```
 
