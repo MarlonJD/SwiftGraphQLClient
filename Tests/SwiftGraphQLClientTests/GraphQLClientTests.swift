@@ -109,7 +109,7 @@ final class GraphQLClientTests: XCTestCase {
         }
     }
 
-    func testApolloStyleResponseFormatConstraintCompiles() async throws {
+    func testSingleResponseFormatConstraintCompiles() async throws {
         let client = ImmediateCompatibilityClient()
         let data = try await client.fetch(CompatibilityQuery())
 

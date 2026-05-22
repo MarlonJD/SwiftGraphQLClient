@@ -21,13 +21,13 @@ public struct CodegenConfiguration: Equatable, Sendable {
     public static func load(from url: URL) throws -> CodegenConfiguration {
         let data = try Data(contentsOf: url)
         if url.pathExtension.lowercased() == "json" {
-            return try loadApolloJSON(from: data)
+            return try loadLegacyJSON(from: data)
         }
         let text = String(decoding: data, as: UTF8.self)
         return try loadYAMLSubset(from: text)
     }
 
-    private static func loadApolloJSON(from data: Data) throws -> CodegenConfiguration {
+    private static func loadLegacyJSON(from data: Data) throws -> CodegenConfiguration {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CodegenError.invalidConfiguration("Expected a JSON object.")
         }

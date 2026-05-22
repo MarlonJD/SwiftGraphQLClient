@@ -1,10 +1,10 @@
 # SwiftGraphQLClient
 
-SwiftGraphQLClient is a SwiftPM GraphQL toolkit being built as a focused Apollo replacement path for Kindred.
+SwiftGraphQLClient is a SwiftPM GraphQL toolkit built as Kindred's typed GraphQL runtime and codegen stack.
 
 Current status: first runtime and Kindred-focused codegen milestones are in place and tested. The package has product scaffolding for the intended modules, while the implemented surface is concentrated on the core HTTP client, GraphQL input/runtime types, auth headers, GraphQL error parsing, refresh retry coordination, multipart upload requests, subscription transports, introspection SDL export, and native Swift operation generation.
 
-The codegen CLI now has an MVP `generate` command. It can read the existing Apollo JSON config or a small YAML config, parse schema scalars/enums/input objects/object fields plus operation and fragment selections, and emit operation structs, input objects, fragments, scalar aliases, and nested `Codable` response `Data` models under the configured namespace.
+The codegen CLI now has an MVP `generate` command. It can read the current YAML config or a legacy JSON config, parse schema scalars/enums/input objects/object fields plus operation and fragment selections, and emit operation structs, input objects, fragments, scalar aliases, and nested `Codable` response `Data` models under the configured namespace.
 
 ## Products
 
@@ -65,13 +65,13 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 
 ## Kindred Migration Notes
 
-See [KindredApolloMigrationInventory.md](/Users/marlonjd/Developer/desktop/asdfawef/Docs/KindredApolloMigrationInventory.md) for the Apollo usage inventory and narrowed MVP order.
+See [KindredGraphQLMigrationInventory.md](/Users/marlonjd/Developer/desktop/asdfawef/Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory and narrowed MVP order.
 
 Kindred smoke-test command used during development:
 
 ```sh
 swift run swift-graphql-codegen generate \
-  --config /Users/marlonjd/Developer/mobile/kindred_swift/kindred_mobile/apollo-codegen-config.json \
+  --config /Users/marlonjd/Developer/mobile/kindred_swift/kindred_mobile/swift-graphql-codegen.yml \
   --output /private/tmp/kindred-swift-graphql-generated-typed
 ```
 
