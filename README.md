@@ -14,7 +14,8 @@ The codegen CLI now has an MVP `generate` command. It can read the current YAML 
 - `SwiftGraphQLUpload`: `GraphQLUpload`, multipart request body builder, and upload-aware request encoder.
 - `SwiftGraphQLWebSocket`: `graphql-transport-ws` subscription transport.
 - `SwiftGraphQLAppSync`: AppSync realtime request/message codec.
-- `swift-graphql-codegen`: CLI for introspection SDL export and Swift generation.
+- `swift-graphql`: CLI for introspection SDL export and Swift generation.
+- `swift-graphql-codegen`: compatibility CLI alias for existing generation scripts.
 - `SwiftGraphQLCodegenPlugin`: SwiftPM build tool plugin that runs generation from `swift-graphql-codegen.yml`.
 
 ## Core Runtime Example
@@ -70,7 +71,7 @@ See [KindredGraphQLMigrationInventory.md](/Users/marlonjd/Developer/desktop/asdf
 Kindred smoke-test command used during development:
 
 ```sh
-swift run swift-graphql-codegen generate \
+swift run swift-graphql generate \
   --config /Users/marlonjd/Developer/mobile/kindred_swift/kindred_mobile/swift-graphql-codegen.yml \
   --output /private/tmp/kindred-swift-graphql-generated-typed
 ```
@@ -78,7 +79,7 @@ swift run swift-graphql-codegen generate \
 Introspection command:
 
 ```sh
-swift run swift-graphql-codegen introspect \
+swift run swift-graphql introspect \
   --endpoint https://example.com/graphql \
   --header "Authorization: Bearer TOKEN" \
   --output schema.graphqls

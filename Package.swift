@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "SwiftGraphQLUpload", targets: ["SwiftGraphQLUpload"]),
         .library(name: "SwiftGraphQLWebSocket", targets: ["SwiftGraphQLWebSocket"]),
         .library(name: "SwiftGraphQLAppSync", targets: ["SwiftGraphQLAppSync"]),
+        .executable(name: "swift-graphql", targets: ["swift-graphql-codegen"]),
         .executable(name: "swift-graphql-codegen", targets: ["swift-graphql-codegen"]),
         .plugin(name: "SwiftGraphQLCodegenPlugin", targets: ["SwiftGraphQLCodegenPlugin"])
     ],

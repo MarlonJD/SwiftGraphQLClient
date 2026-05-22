@@ -68,8 +68,10 @@ enum SwiftGraphQLCodegenCLI {
         OVERVIEW: SwiftGraphQLClient code generation tool
 
         USAGE:
-          swift-graphql-codegen introspect --endpoint URL [--header "Name: Value"] --output schema.graphqls
-          swift-graphql-codegen generate --config swift-graphql-codegen.yml [--output GeneratedGraphQL]
+          swift-graphql introspect --endpoint URL [--header "Name: Value"] --output schema.graphqls
+          swift-graphql generate --config swift-graphql-codegen.yml [--output GeneratedGraphQL]
+
+        The swift-graphql-codegen executable remains available as a compatibility alias.
         """)
     }
 
