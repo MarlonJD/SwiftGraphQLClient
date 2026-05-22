@@ -142,7 +142,7 @@ struct SwiftCodeGenerator: Sendable {
             output += "  struct \(structName): \(operationProtocol(operation.kind)) {\n"
             output += "    public static let operationName = \"\(operation.name)\"\n"
             output += "    public static let document = #\"\"\"\n\(documentSource(for: operation, fragments: fragments))\n\"\"\"#\n\n"
-            output += "    public static let selections: [GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
+            output += "    public static let selections: [SwiftGraphQLClient.GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
             for variable in operation.variables {
                 output += "    public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema))\n"
             }

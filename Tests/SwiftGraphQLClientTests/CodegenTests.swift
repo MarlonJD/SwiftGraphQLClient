@@ -102,7 +102,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(output.contains("struct LoginMutation: GraphQLMutation"))
         XCTAssertTrue(output.contains("struct MessagesQuery: GraphQLQuery"))
         XCTAssertTrue(output.contains("struct ViewerSubscriptionQuery: GraphQLQuery"))
-        XCTAssertTrue(output.contains("public static let selections: [GraphQLSelection]"))
+        XCTAssertTrue(output.contains("public static let selections: [SwiftGraphQLClient.GraphQLSelection]"))
         XCTAssertTrue(output.contains(#".field(name: "messages", responseName: "messages""#))
         XCTAssertTrue(output.contains(#".fragmentSpread("MessageName")"#))
         XCTAssertTrue(output.contains("fragment MessageName on Message"))
