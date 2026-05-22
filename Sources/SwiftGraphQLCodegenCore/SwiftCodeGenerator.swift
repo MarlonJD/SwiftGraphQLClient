@@ -142,6 +142,7 @@ struct SwiftCodeGenerator: Sendable {
             output += "  struct \(structName): \(operationProtocol(operation.kind)) {\n"
             output += "    public static let operationName = \"\(operation.name)\"\n"
             output += "    public static let document = #\"\"\"\n\(documentSource(for: operation, fragments: fragments))\n\"\"\"#\n\n"
+            output += "    public static let selections: [GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
             for variable in operation.variables {
                 output += "    public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema))\n"
             }
@@ -539,6 +540,45 @@ struct SwiftCodeGenerator: Sendable {
         default:
             return trimmed
         }
+    }
+
+    private func renderSelectionMetadata(_ selections: [GraphQLSelection], indent: Int) -> String {
+        guard !selections.isEmpty else { return "[]" }
+        let baseIndent = String(repeating: " ", count: indent)
+        let itemIndent = String(repeating: " ", count: indent + 2)
+        var output = "[\n"
+        for (index, selection) in selections.enumerated() {
+            output += itemIndent
+            output += renderSelectionMetadataItem(selection, indent: indent + 2)
+            if index != selections.count - 1 {
+                output += ","
+            }
+            output += "\n"
+        }
+        output += "\(baseIndent)]"
+        return output
+    }
+
+    private func renderSelectionMetadataItem(_ selection: GraphQLSelection, indent: Int) -> String {
+        switch selection {
+        case .field(let field):
+            return ".field(name: \(swiftStringLiteral(field.name)), responseName: \(swiftStringLiteral(field.responseName)), selections: \(renderSelectionMetadata(field.selections, indent: indent)))"
+        case .fragmentSpread(let name):
+            return ".fragmentSpread(\(swiftStringLiteral(name)))"
+        case .inlineFragment(let typeName, let selections):
+            let renderedTypeName = typeName.map(swiftStringLiteral) ?? "nil"
+            return ".inlineFragment(typeName: \(renderedTypeName), selections: \(renderSelectionMetadata(selections, indent: indent)))"
+        }
+    }
+
+    private func swiftStringLiteral(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        return "\"\(escaped)\""
     }
 
     private func swiftSelectionSetName(for responseName: String, type: GraphQLTypeReference) -> String {

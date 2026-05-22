@@ -7,6 +7,7 @@ public protocol GraphQLOperation: Sendable {
 
     static var operationName: String { get }
     static var document: String { get }
+    static var selections: [GraphQLSelection] { get }
     var variables: Variables { get }
 }
 
@@ -37,3 +38,13 @@ public enum CachePolicy {
 }
 
 public enum SingleResponseFormat: Sendable {}
+
+public indirect enum GraphQLSelection: Sendable, Equatable, Codable {
+    case field(name: String, responseName: String, selections: [GraphQLSelection])
+    case fragmentSpread(String)
+    case inlineFragment(typeName: String?, selections: [GraphQLSelection])
+}
+
+public extension GraphQLOperation {
+    static var selections: [GraphQLSelection] { [] }
+}
