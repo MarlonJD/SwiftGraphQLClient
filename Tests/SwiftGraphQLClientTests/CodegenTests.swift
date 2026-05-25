@@ -223,6 +223,131 @@ final class CodegenTests: XCTestCase {
         XCTAssertEqual(request.httpBody, manifest)
     }
 
+    func testComplexGoldenCodegenCoversAliasesAbstractTypesDefaultsAndCustomScalars() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftGraphQLCodegenGoldenTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let schemaURL = root.appendingPathComponent("schema.graphqls")
+        let operationsDirectory = root.appendingPathComponent("Operations")
+        try FileManager.default.createDirectory(at: operationsDirectory, withIntermediateDirectories: true)
+        try """
+        scalar DateTime
+        scalar JSON
+        schema {
+          query: RootQuery
+        }
+        interface Node {
+          id: ID!
+        }
+        type User implements Node {
+          id: ID!
+          displayName: String!
+          profile: Profile
+          createdAt: DateTime!
+        }
+        type Bot implements Node {
+          id: ID!
+          handle: String!
+          config: JSON
+        }
+        union Actor = User | Bot
+        type Profile {
+          avatarURL: String
+          badges: [String!]!
+        }
+        type FeedEdge {
+          cursor: String!
+          node: Actor!
+        }
+        type FeedConnection {
+          edges: [FeedEdge!]!
+          pageInfo: PageInfo!
+        }
+        type PageInfo {
+          hasNextPage: Boolean!
+          endCursor: String
+        }
+        input FeedInput {
+          first: Int!
+          after: String
+          includeBots: Boolean = true
+        }
+        type RootQuery {
+          feed(input: FeedInput!): FeedConnection!
+        }
+        """.write(to: schemaURL, atomically: true, encoding: .utf8)
+
+        try """
+        query ComplexFeed($first: Int! = 20, $after: String, $includeBots: Boolean! = true) {
+          feed(input: { first: $first, after: $after, includeBots: $includeBots }) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              cursor
+              actor: node {
+                __typename
+                ...ActorDetails
+                ... on User {
+                  profile {
+                    avatar: avatarURL
+                    badges
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        fragment ActorDetails on Actor {
+          ... on User {
+            id
+            displayName
+            createdAt
+          }
+          ... on Bot {
+            id
+            handle
+            config
+          }
+        }
+        """.write(to: operationsDirectory.appendingPathComponent("Feed.graphql"), atomically: true, encoding: .utf8)
+
+        let configURL = root.appendingPathComponent("swift-graphql-codegen.yml")
+        try """
+        namespace: GoldenAPI
+        schema:
+          - schema.graphqls
+        operations:
+          - Operations/**/*.graphql
+        output: GeneratedGraphQL
+        scalars:
+          DateTime: Date
+          JSON: GraphQLJSON
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let outputURL = try CodegenRunner.generate(configURL: configURL)
+        let output = try String(contentsOf: outputURL)
+
+        XCTAssertTrue(output.contains("public typealias DateTime = Date"))
+        XCTAssertTrue(output.contains("public typealias JSON = GraphQLJSON"))
+        XCTAssertTrue(output.contains("struct ComplexFeedQuery: GraphQLQuery"))
+        XCTAssertTrue(output.contains("first: Int32 = 20"))
+        XCTAssertTrue(output.contains("after: GraphQLNullable<String> = .none"))
+        XCTAssertTrue(output.contains("includeBots: Bool = true"))
+        XCTAssertTrue(output.contains("public var actor: Actor"))
+        XCTAssertTrue(output.contains("public var asBot: AsBot?"))
+        XCTAssertTrue(output.contains("public var asUser: AsUser?"))
+        XCTAssertTrue(output.contains("public var createdAt: Date"))
+        XCTAssertTrue(output.contains("public var config: GraphQLJSON?"))
+        XCTAssertTrue(output.contains("public var avatar: String?"))
+        XCTAssertTrue(output.contains(#".field(name: "avatarURL", responseName: "avatar""#))
+        XCTAssertTrue(output.contains("GraphQLResponseCodingKey(\"__typename\")"))
+    }
+
     func testIntrospectionJSONPrintsSDL() throws {
         let fixture = """
         {

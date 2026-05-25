@@ -132,6 +132,61 @@ final class GraphQLWebSocketClientTests: XCTestCase {
         XCTAssertEqual(messageTypes.filter { $0 == "subscribe" }.count, 2)
     }
 
+    func testMultiplexedClientReconnectsActiveOperationsWithFreshAuthHeaders() async throws {
+        let firstSocket = MockGraphQLWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#)
+        ])
+        let secondSocket = MockGraphQLWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#),
+            .string(#"{"type":"next","id":"sub-1","payload":{"data":{"messageCreated":{"id":"message-1","requestId":"request-1"}}}}"#),
+            .string(#"{"type":"next","id":"sub-2","payload":{"data":{"messageCreated":{"id":"message-2","requestId":"request-2"}}}}"#),
+            .string(#"{"type":"complete","id":"sub-1"}"#),
+            .string(#"{"type":"complete","id":"sub-2"}"#)
+        ])
+        let connector = SequencedMockGraphQLWebSocketConnector(sockets: [firstSocket, secondSocket])
+        let authProvider = RotatingWebSocketAuthProvider()
+        let client = GraphQLMultiplexedWebSocketClient(
+            configuration: GraphQLWebSocketConfiguration(
+                endpointURL: URL(string: "wss://api.example.com/graphql")!,
+                authProvider: authProvider,
+                maxReconnectAttempts: 1,
+                reconnectBackoff: 0
+            ),
+            connector: connector
+        )
+
+        var firstIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-1"),
+            id: "sub-1"
+        ).makeAsyncIterator()
+        var secondIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-2"),
+            id: "sub-2"
+        ).makeAsyncIterator()
+
+        let first = try await firstIterator.next()
+        let second = try await secondIterator.next()
+        let firstCompleted = try await firstIterator.next()
+        let secondCompleted = try await secondIterator.next()
+
+        XCTAssertEqual(first?.messageCreated.id, "message-1")
+        XCTAssertEqual(second?.messageCreated.id, "message-2")
+        XCTAssertNil(firstCompleted)
+        XCTAssertNil(secondCompleted)
+        XCTAssertEqual(connector.requests.count, 2)
+        XCTAssertEqual(connector.requests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer token-1")
+        XCTAssertEqual(connector.requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer token-2")
+        let authHeaderCount = await authProvider.count
+        XCTAssertEqual(authHeaderCount, 2)
+
+        let firstSent = await firstSocket.sentStrings
+        let secondSent = await secondSocket.sentStrings
+        let firstSentTypes = try firstSent.map(messageType)
+        let secondSentTypes = try secondSent.map(messageType)
+        XCTAssertEqual(firstSentTypes.filter { $0 == "subscribe" }.count, 2)
+        XCTAssertEqual(secondSentTypes.filter { $0 == "subscribe" }.count, 2)
+    }
+
     func testCodecBuildsProtocolMessages() throws {
         let codec = makeCodec(connectionInitPayload: .object(["source": .string("test")]))
 
@@ -285,6 +340,15 @@ private final class SequencedMockGraphQLWebSocketConnector: GraphQLWebSocketConn
         let socket = sockets.removeFirst()
         lock.unlock()
         return socket
+    }
+}
+
+private actor RotatingWebSocketAuthProvider: GraphQLAuthProvider {
+    private(set) var count = 0
+
+    func graphQLAuthorizationHeaders() async throws -> [String: String] {
+        count += 1
+        return ["Authorization": "Bearer token-\(count)"]
     }
 }
 

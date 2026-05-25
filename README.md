@@ -104,6 +104,8 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 
 See [KindredGraphQLMigrationInventory.md](Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory.
 
+See [ApolloMigrationGuide.md](Docs/ApolloMigrationGuide.md) for common Apollo iOS API replacements.
+
 See [SwiftGraphQLClient-0.6.0-Plan.md](Docs/SwiftGraphQLClient-0.6.0-Plan.md) for the next production-hardening plan.
 
 Kindred smoke-test command used during development:

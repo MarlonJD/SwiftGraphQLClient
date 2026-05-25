@@ -215,6 +215,52 @@ final class GraphQLCacheTests: XCTestCase {
         XCTAssertFalse(response.isPartial)
         XCTAssertEqual(response.data, .object(["counter": .object(["value": .int(42)])]))
     }
+
+    func testOptimisticLayersResolveRollbackAndCommitInStackOrder() async {
+        let store = GraphQLMemoryStore()
+        let id = GraphQLRecordID(typename: "Message", id: "1")
+        await store.write(GraphQLRecord(id: id, fields: ["text": .string("base")]))
+
+        let firstLayer = await store.beginOptimisticLayer(id: GraphQLOptimisticLayerID(rawValue: "first"))
+        let secondLayer = await store.beginOptimisticLayer(id: GraphQLOptimisticLayerID(rawValue: "second"))
+        await store.writeOptimistic(GraphQLRecord(id: id, fields: ["text": .string("first")]), layerID: firstLayer)
+        await store.writeOptimistic(GraphQLRecord(id: id, fields: ["text": .string("second")]), layerID: secondLayer)
+
+        let secondLayerValue = await store.read(id)?.fields["text"]
+        XCTAssertEqual(secondLayerValue, .string("second"))
+
+        await store.rollbackOptimisticLayer(id: secondLayer)
+        let rolledBackValue = await store.read(id)?.fields["text"]
+        XCTAssertEqual(rolledBackValue, .string("first"))
+
+        await store.commitOptimisticLayer(id: firstLayer)
+        let committedValue = await store.read(id)?.fields["text"]
+        XCTAssertEqual(committedValue, .string("first"))
+    }
+
+    func testConcurrentRecordWritesAndTrimRemainConsistent() async {
+        let store = GraphQLMemoryStore()
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<50 {
+                group.addTask {
+                    await store.write(GraphQLRecord(
+                        id: GraphQLRecordID(typename: "StressRecord", id: "\(index)"),
+                        fields: ["index": .int(Int64(index))]
+                    ))
+                }
+            }
+        }
+
+        let writtenCount = await store.recordIDs().count
+        XCTAssertEqual(writtenCount, 50)
+        let evicted = await store.trim(maxRecordCount: 10)
+        let remaining = await store.recordIDs()
+
+        XCTAssertEqual(evicted.count, 40)
+        XCTAssertEqual(remaining.count, 10)
+        XCTAssertEqual(Set(evicted).intersection(remaining), [])
+    }
 }
 
 private struct CacheViewerQuery: GraphQLQuery {
