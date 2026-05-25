@@ -5,15 +5,24 @@ public struct AppSyncRealtimeConfiguration: Sendable {
     public var realtimeEndpointURL: URL
     public var graphQLEndpointURL: URL
     public var authProvider: (any GraphQLAuthProvider)?
+    public var keepAliveTimeout: TimeInterval?
+    public var maxReconnectAttempts: Int
+    public var reconnectBackoff: TimeInterval
 
     public init(
         realtimeEndpointURL: URL,
         graphQLEndpointURL: URL,
-        authProvider: (any GraphQLAuthProvider)? = nil
+        authProvider: (any GraphQLAuthProvider)? = nil,
+        keepAliveTimeout: TimeInterval? = nil,
+        maxReconnectAttempts: Int = 0,
+        reconnectBackoff: TimeInterval = 0.5
     ) {
         self.realtimeEndpointURL = realtimeEndpointURL
         self.graphQLEndpointURL = graphQLEndpointURL
         self.authProvider = authProvider
+        self.keepAliveTimeout = keepAliveTimeout
+        self.maxReconnectAttempts = maxReconnectAttempts
+        self.reconnectBackoff = reconnectBackoff
     }
 }
 
@@ -30,6 +39,7 @@ public enum AppSyncRealtimeEvent<Payload: Sendable>: Sendable {
 public enum AppSyncRealtimeError: LocalizedError, Sendable {
     case serverError(GraphQLJSONValue?)
     case unsupportedMessage
+    case keepAliveTimeout
 
     public var errorDescription: String? {
         switch self {
@@ -37,6 +47,8 @@ public enum AppSyncRealtimeError: LocalizedError, Sendable {
             return "The AppSync realtime endpoint returned an error."
         case .unsupportedMessage:
             return "The AppSync realtime endpoint returned an unsupported message."
+        case .keepAliveTimeout:
+            return "The AppSync realtime endpoint did not send a keepalive message before the timeout."
         }
     }
 }
@@ -333,41 +345,90 @@ private final class AppSyncSubscriptionRunner<Subscription: GraphQLSubscription>
     }
 
     private func run() async {
-        do {
-            let headers = try await codec.authHeaders()
-            let request = try codec.makeWebSocketRequest(headers: headers)
-            let socket = connector.appSyncWebSocketTask(with: request)
-            setSocket(socket)
-            socket.resume()
-            try await socket.send(.string(try codec.connectionInitMessage()))
-
-            while !Task.isCancelled {
-                let message = try await socket.receive()
-                switch try decode(message) {
-                case .connectionAck:
-                    let startMessage = try codec.startMessage(id: id, subscription: subscription, headers: headers)
-                    try await socket.send(.string(startMessage))
-                case .startAck:
-                    onReady?()
-                case .keepAlive, .ignored:
-                    continue
-                case .data(let data):
-                    continuation.yield(data)
-                case .error(let payload):
-                    continuation.finish(throwing: AppSyncRealtimeError.serverError(payload))
-                    return
-                case .complete:
+        var attempt = 0
+        while !Task.isCancelled {
+            do {
+                try await runOnce()
+                continuation.finish()
+                return
+            } catch {
+                lockedSocket()?.cancel(with: .goingAway, reason: nil)
+                if Task.isCancelled {
                     continuation.finish()
                     return
                 }
+                guard shouldReconnect(after: error, attempt: attempt) else {
+                    continuation.finish(throwing: error)
+                    return
+                }
+                attempt += 1
+                await sleepBeforeReconnect()
             }
-            continuation.finish()
-        } catch {
-            if Task.isCancelled {
-                continuation.finish()
-            } else {
-                continuation.finish(throwing: error)
+        }
+        continuation.finish()
+    }
+
+    private func runOnce() async throws {
+        let headers = try await codec.authHeaders()
+        let request = try codec.makeWebSocketRequest(headers: headers)
+        let socket = connector.appSyncWebSocketTask(with: request)
+        setSocket(socket)
+        socket.resume()
+        try await socket.send(.string(try codec.connectionInitMessage()))
+
+        while !Task.isCancelled {
+            let message = try await receive(from: socket)
+            switch try decode(message) {
+            case .connectionAck:
+                let startMessage = try codec.startMessage(id: id, subscription: subscription, headers: headers)
+                try await socket.send(.string(startMessage))
+            case .startAck:
+                onReady?()
+            case .keepAlive, .ignored:
+                continue
+            case .data(let data):
+                continuation.yield(data)
+            case .error(let payload):
+                throw AppSyncRealtimeError.serverError(payload)
+            case .complete:
+                return
             }
+        }
+    }
+
+    private func shouldReconnect(after error: Error, attempt: Int) -> Bool {
+        guard attempt < codec.configuration.maxReconnectAttempts else { return false }
+        if error is CancellationError { return false }
+        if let realtimeError = error as? AppSyncRealtimeError,
+           case .serverError = realtimeError {
+            return false
+        }
+        return true
+    }
+
+    private func sleepBeforeReconnect() async {
+        let seconds = max(0, codec.configuration.reconnectBackoff)
+        guard seconds > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    private func receive(from socket: any AppSyncWebSocketTask) async throws -> URLSessionWebSocketTask.Message {
+        guard let timeout = codec.configuration.keepAliveTimeout, timeout > 0 else {
+            return try await socket.receive()
+        }
+        return try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            group.addTask {
+                try await socket.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw AppSyncRealtimeError.keepAliveTimeout
+            }
+            guard let message = try await group.next() else {
+                throw AppSyncRealtimeError.unsupportedMessage
+            }
+            group.cancelAll()
+            return message
         }
     }
 

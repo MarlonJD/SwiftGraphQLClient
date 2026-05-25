@@ -54,6 +54,41 @@ final class GraphQLWebSocketClientTests: XCTestCase {
         XCTAssertTrue(didResume)
     }
 
+    func testClientReconnectsAfterTransportFailureAndResubscribes() async throws {
+        let firstSocket = MockGraphQLWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#)
+        ])
+        let secondSocket = MockGraphQLWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#),
+            .string(#"{"type":"next","id":"sub-1","payload":{"data":{"messageCreated":{"id":"message-2","requestId":"request-1"}}}}"#),
+            .string(#"{"type":"complete","id":"sub-1"}"#)
+        ])
+        let connector = SequencedMockGraphQLWebSocketConnector(sockets: [firstSocket, secondSocket])
+        let client = GraphQLWebSocketClient(
+            configuration: GraphQLWebSocketConfiguration(
+                endpointURL: URL(string: "wss://api.example.com/graphql")!,
+                maxReconnectAttempts: 1,
+                reconnectBackoff: 0
+            ),
+            connector: connector
+        )
+
+        var iterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-1"),
+            id: "sub-1"
+        ).makeAsyncIterator()
+        let data = try await iterator.next()
+        let completed = try await iterator.next()
+
+        XCTAssertEqual(data?.messageCreated.id, "message-2")
+        XCTAssertNil(completed)
+        XCTAssertEqual(connector.requests.count, 2)
+        let firstSent = await firstSocket.sentStrings
+        let secondSent = await secondSocket.sentStrings
+        XCTAssertEqual(try firstSent.map(messageType), ["connection_init", "subscribe"])
+        XCTAssertEqual(try secondSent.map(messageType), ["connection_init", "subscribe"])
+    }
+
     func testCodecBuildsProtocolMessages() throws {
         let codec = makeCodec(connectionInitPayload: .object(["source": .string("test")]))
 
@@ -181,6 +216,30 @@ private final class MockGraphQLWebSocketConnector: GraphQLWebSocketConnecting, @
     func graphQLWebSocketTask(with request: URLRequest) -> any GraphQLWebSocketTask {
         lock.lock()
         storedRequests.append(request)
+        lock.unlock()
+        return socket
+    }
+}
+
+private final class SequencedMockGraphQLWebSocketConnector: GraphQLWebSocketConnecting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var sockets: [MockGraphQLWebSocketTask]
+    private var storedRequests: [URLRequest] = []
+
+    var requests: [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedRequests
+    }
+
+    init(sockets: [MockGraphQLWebSocketTask]) {
+        self.sockets = sockets
+    }
+
+    func graphQLWebSocketTask(with request: URLRequest) -> any GraphQLWebSocketTask {
+        lock.lock()
+        storedRequests.append(request)
+        let socket = sockets.removeFirst()
         lock.unlock()
         return socket
     }

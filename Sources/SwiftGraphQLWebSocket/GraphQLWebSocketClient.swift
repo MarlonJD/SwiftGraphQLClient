@@ -5,15 +5,24 @@ public struct GraphQLWebSocketConfiguration: Sendable {
     public var endpointURL: URL
     public var authProvider: (any GraphQLAuthProvider)?
     public var connectionInitPayload: GraphQLJSONValue?
+    public var keepAliveTimeout: TimeInterval?
+    public var maxReconnectAttempts: Int
+    public var reconnectBackoff: TimeInterval
 
     public init(
         endpointURL: URL,
         authProvider: (any GraphQLAuthProvider)? = nil,
-        connectionInitPayload: GraphQLJSONValue? = nil
+        connectionInitPayload: GraphQLJSONValue? = nil,
+        keepAliveTimeout: TimeInterval? = nil,
+        maxReconnectAttempts: Int = 0,
+        reconnectBackoff: TimeInterval = 0.5
     ) {
         self.endpointURL = endpointURL
         self.authProvider = authProvider
         self.connectionInitPayload = connectionInitPayload
+        self.keepAliveTimeout = keepAliveTimeout
+        self.maxReconnectAttempts = maxReconnectAttempts
+        self.reconnectBackoff = reconnectBackoff
     }
 }
 
@@ -31,6 +40,7 @@ public enum GraphQLWebSocketEvent<Payload: Sendable>: Sendable {
 public enum GraphQLWebSocketError: LocalizedError, Sendable {
     case serverError(GraphQLJSONValue?)
     case unsupportedMessage
+    case keepAliveTimeout
 
     public var errorDescription: String? {
         switch self {
@@ -38,6 +48,8 @@ public enum GraphQLWebSocketError: LocalizedError, Sendable {
             return "The GraphQL WebSocket endpoint returned an error."
         case .unsupportedMessage:
             return "The GraphQL WebSocket endpoint returned an unsupported message."
+        case .keepAliveTimeout:
+            return "The GraphQL WebSocket endpoint did not send a message before the keepalive timeout."
         }
     }
 }
@@ -327,48 +339,100 @@ private final class GraphQLWebSocketSubscriptionRunner<Subscription: GraphQLSubs
     }
 
     private func run() async {
-        do {
-            let headers = try await codec.authHeaders()
-            let request = codec.makeWebSocketRequest(headers: headers)
-            let socket = connector.graphQLWebSocketTask(with: request)
-            setSocket(socket)
-            socket.resume()
-            try await socket.send(.string(try codec.connectionInitMessage()))
-
-            var didSubscribe = false
-            while !Task.isCancelled {
-                let message = try await socket.receive()
-                switch try decode(message) {
-                case .connectionAck:
-                    guard !didSubscribe else { continue }
-                    didSubscribe = true
-                    let subscribeMessage = try codec.subscribeMessage(id: id, subscription: subscription)
-                    try await socket.send(.string(subscribeMessage))
-                    onReady?()
-                case .ping(let payload):
-                    try await socket.send(.string(try codec.pongMessage(payload: payload)))
-                case .pong, .ignored:
-                    continue
-                case .next(let data):
-                    continuation.yield(data)
-                case .graphQLErrors(let errors):
-                    continuation.finish(throwing: GraphQLClientError.graphQLErrors(errors))
-                    return
-                case .error(let payload):
-                    continuation.finish(throwing: GraphQLWebSocketError.serverError(payload))
-                    return
-                case .complete:
+        var attempt = 0
+        while !Task.isCancelled {
+            do {
+                try await runOnce()
+                continuation.finish()
+                return
+            } catch {
+                lockedSocket()?.cancel(with: .goingAway, reason: nil)
+                if Task.isCancelled {
                     continuation.finish()
                     return
                 }
+                guard shouldReconnect(after: error, attempt: attempt) else {
+                    continuation.finish(throwing: error)
+                    return
+                }
+                attempt += 1
+                await sleepBeforeReconnect()
             }
-            continuation.finish()
-        } catch {
-            if Task.isCancelled {
-                continuation.finish()
-            } else {
-                continuation.finish(throwing: error)
+        }
+        continuation.finish()
+    }
+
+    private func runOnce() async throws {
+        let headers = try await codec.authHeaders()
+        let request = codec.makeWebSocketRequest(headers: headers)
+        let socket = connector.graphQLWebSocketTask(with: request)
+        setSocket(socket)
+        socket.resume()
+        try await socket.send(.string(try codec.connectionInitMessage()))
+
+        var didSubscribe = false
+        while !Task.isCancelled {
+            let message = try await receive(from: socket)
+            switch try decode(message) {
+            case .connectionAck:
+                guard !didSubscribe else { continue }
+                didSubscribe = true
+                let subscribeMessage = try codec.subscribeMessage(id: id, subscription: subscription)
+                try await socket.send(.string(subscribeMessage))
+                onReady?()
+            case .ping(let payload):
+                try await socket.send(.string(try codec.pongMessage(payload: payload)))
+            case .pong, .ignored:
+                continue
+            case .next(let data):
+                continuation.yield(data)
+            case .graphQLErrors(let errors):
+                throw GraphQLClientError.graphQLErrors(errors)
+            case .error(let payload):
+                throw GraphQLWebSocketError.serverError(payload)
+            case .complete:
+                return
             }
+        }
+    }
+
+    private func shouldReconnect(after error: Error, attempt: Int) -> Bool {
+        guard attempt < codec.configuration.maxReconnectAttempts else { return false }
+        if error is CancellationError { return false }
+        if let clientError = error as? GraphQLClientError,
+           case .graphQLErrors = clientError {
+            return false
+        }
+        if let webSocketError = error as? GraphQLWebSocketError,
+           case .serverError = webSocketError {
+            return false
+        }
+        return true
+    }
+
+    private func sleepBeforeReconnect() async {
+        let seconds = max(0, codec.configuration.reconnectBackoff)
+        guard seconds > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    private func receive(from socket: any GraphQLWebSocketTask) async throws -> URLSessionWebSocketTask.Message {
+        guard let timeout = codec.configuration.keepAliveTimeout, timeout > 0 else {
+            return try await socket.receive()
+        }
+        return try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            group.addTask {
+                try await socket.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw GraphQLWebSocketError.keepAliveTimeout
+            }
+            guard let message = try await group.next() else {
+                throw GraphQLWebSocketError.unsupportedMessage
+            }
+            group.cancelAll()
+            return message
         }
     }
 

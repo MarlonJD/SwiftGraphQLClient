@@ -1,4 +1,5 @@
 import Foundation
+import SwiftGraphQLCache
 import XCTest
 @testable import SwiftGraphQLClient
 import SwiftGraphQLUpload
@@ -79,6 +80,64 @@ final class GraphQLClientTests: XCTestCase {
         let requestCount = await session.count
         XCTAssertEqual(refreshCount, 1)
         XCTAssertEqual(requestCount, 2)
+    }
+
+    func testNetworkOnlyWritesNormalizedCacheAndCacheOnlyReadsIt() async throws {
+        let cache = GraphQLNormalizedCache()
+        let session = SequencedSession(responses: [
+            Self.response(
+                statusCode: 200,
+                body: #"{"data":{"viewer":{"__typename":"User","id":"user-1","name":"Cached"}}}"#
+            )
+        ])
+        let client = GraphQLClient(
+            configuration: GraphQLClientConfiguration(
+                endpointURL: URL(string: "https://example.com/graphql")!,
+                responseCache: cache
+            ),
+            session: session
+        )
+
+        let network = try await client.fetch(ViewerQuery(id: "user-1"), cachePolicy: .networkOnly)
+        let cached = try await client.fetch(ViewerQuery(id: "user-1"), cachePolicy: .cacheOnly)
+
+        XCTAssertEqual(network.viewer.name, "Cached")
+        XCTAssertEqual(cached.viewer.name, "Cached")
+        let requestCount = await session.count
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testCacheFirstUsesCompleteCachedResponseWithoutNetwork() async throws {
+        let cache = GraphQLNormalizedCache()
+        let warmClient = GraphQLClient(
+            configuration: GraphQLClientConfiguration(
+                endpointURL: URL(string: "https://example.com/graphql")!,
+                responseCache: cache
+            ),
+            session: SequencedSession(responses: [
+                Self.response(
+                    statusCode: 200,
+                    body: #"{"data":{"viewer":{"__typename":"User","id":"user-1","name":"Warm"}}}"#
+                )
+            ])
+        )
+        _ = try await warmClient.fetch(ViewerQuery(id: "user-1"), cachePolicy: .networkOnly)
+
+        let failingSession = RecordingSession { _ in
+            XCTFail("cacheFirst should not hit the network when a complete cached response exists.")
+            return Self.response(statusCode: 500, body: #"{"errors":[{"message":"unexpected"}]}"#)
+        }
+        let cachedClient = GraphQLClient(
+            configuration: GraphQLClientConfiguration(
+                endpointURL: URL(string: "https://example.com/graphql")!,
+                responseCache: cache
+            ),
+            session: failingSession
+        )
+
+        let cached = try await cachedClient.fetch(ViewerQuery(id: "user-1"), cachePolicy: .cacheFirst)
+
+        XCTAssertEqual(cached.viewer.name, "Warm")
     }
 
     func testSubscribeUsesConfiguredSubscriptionTransport() async throws {
@@ -213,6 +272,12 @@ final class GraphQLClientTests: XCTestCase {
 private struct ViewerQuery: GraphQLQuery {
     static let operationName = "Viewer"
     static let document = "query Viewer($id: ID!) { viewer(id: $id) { id name } }"
+    static let selections: [GraphQLSelection] = [
+        .field(name: "viewer", responseName: "viewer", selections: [
+            .field(name: "id", responseName: "id", selections: []),
+            .field(name: "name", responseName: "name", selections: [])
+        ])
+    ]
 
     struct Variables: Encodable, Sendable {
         let id: GraphQLID

@@ -88,6 +88,9 @@ final class CodegenTests: XCTestCase {
         operations:
           - Operations/**/*.graphql
         output: GeneratedGraphQL
+        scalars:
+          AWSDateTime: Date
+          AWSJSON: GraphQLJSON
         """.write(to: configURL, atomically: true, encoding: .utf8)
 
         let outputURL = try CodegenRunner.generate(configURL: configURL)
@@ -96,6 +99,8 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(output.contains("public enum KindredAPI"))
         XCTAssertTrue(output.contains("import SwiftGraphQLUpload"))
         XCTAssertTrue(output.contains("public typealias Upload = GraphQLUpload"))
+        XCTAssertTrue(output.contains("public typealias AWSDateTime = Date"))
+        XCTAssertTrue(output.contains("public typealias AWSJSON = GraphQLJSON"))
         XCTAssertTrue(output.contains("struct LoginInput"))
         XCTAssertTrue(output.contains("deviceId: GraphQLNullable<String> = .none"))
         XCTAssertTrue(output.contains("enum MessagePageDirection"))

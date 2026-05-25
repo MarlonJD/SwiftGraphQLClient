@@ -90,6 +90,8 @@ public enum GraphQLClientError: LocalizedError, Sendable {
     case httpStatus(statusCode: Int, body: Data?)
     case graphQLErrors([GraphQLError])
     case missingData
+    case cacheMiss
+    case partialCacheHit(missingFields: [String])
     case unsupportedCachePolicy(GraphQLCachePolicy)
     case unsupportedSubscriptions
 
@@ -103,6 +105,10 @@ public enum GraphQLClientError: LocalizedError, Sendable {
             return errors.first?.message ?? "The GraphQL endpoint returned errors."
         case .missingData:
             return "The GraphQL response did not contain data."
+        case .cacheMiss:
+            return "The GraphQL cache does not contain a complete response for this operation."
+        case .partialCacheHit(let missingFields):
+            return "The GraphQL cache response is partial. Missing fields: \(missingFields.joined(separator: ", "))."
         case .unsupportedCachePolicy(let policy):
             return "The cache policy \(policy.rawValue) is not supported by this client."
         case .unsupportedSubscriptions:
@@ -116,7 +122,7 @@ public enum GraphQLClientError: LocalizedError, Sendable {
             return statusCode == 401
         case .graphQLErrors(let errors):
             return errors.contains { $0.isUnauthorized }
-        case .invalidResponse, .missingData, .unsupportedCachePolicy, .unsupportedSubscriptions:
+        case .invalidResponse, .missingData, .cacheMiss, .partialCacheHit, .unsupportedCachePolicy, .unsupportedSubscriptions:
             return false
         }
     }

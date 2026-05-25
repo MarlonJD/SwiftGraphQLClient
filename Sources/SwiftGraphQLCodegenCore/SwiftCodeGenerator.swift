@@ -6,18 +6,19 @@ struct SwiftCodeGenerator: Sendable {
     func generate(
         namespace: String,
         schema: GraphQLSchema,
-        documents: GraphQLDocumentDefinitions
+        documents: GraphQLDocumentDefinitions,
+        scalarMappings: [String: String] = [:]
     ) throws -> String {
         var output: [String] = []
-        output.append(generateHeader(namespace: namespace, schema: schema))
+        output.append(generateHeader(namespace: namespace, schema: schema, scalarMappings: scalarMappings))
         output.append(generateEnums(schema.enums.values.sorted { $0.name < $1.name }, namespace: namespace))
-        output.append(generateInputObjects(schema.inputObjects.values.sorted { $0.name < $1.name }, schema: schema, namespace: namespace))
-        output.append(try generateFragments(documents.fragments, schema: schema, namespace: namespace))
-        output.append(try generateOperations(documents.operations, fragments: documents.fragments, schema: schema, namespace: namespace))
+        output.append(generateInputObjects(schema.inputObjects.values.sorted { $0.name < $1.name }, schema: schema, namespace: namespace, scalarMappings: scalarMappings))
+        output.append(try generateFragments(documents.fragments, schema: schema, namespace: namespace, scalarMappings: scalarMappings))
+        output.append(try generateOperations(documents.operations, fragments: documents.fragments, schema: schema, namespace: namespace, scalarMappings: scalarMappings))
         return output.joined(separator: "\n")
     }
 
-    private func generateHeader(namespace: String, schema: GraphQLSchema) -> String {
+    private func generateHeader(namespace: String, schema: GraphQLSchema, scalarMappings: [String: String]) -> String {
         var imports = [
             "import Foundation",
             "import SwiftGraphQLClient"
@@ -29,7 +30,7 @@ struct SwiftCodeGenerator: Sendable {
         var aliases = ["  public typealias ID = String"]
         let builtInScalars: Set<String> = ["String", "Int", "Float", "Boolean", "ID"]
         for scalar in schema.scalars.sorted() where !builtInScalars.contains(scalar) {
-            let swiftType = scalar == "Upload" ? "GraphQLUpload" : "String"
+            let swiftType = scalarMappings[scalar] ?? (scalar == "Upload" ? "GraphQLUpload" : "String")
             aliases.append("  public typealias \(scalar) = \(swiftType)")
         }
 
@@ -63,21 +64,22 @@ struct SwiftCodeGenerator: Sendable {
     private func generateInputObjects(
         _ inputObjects: [GraphQLInputObjectDefinition],
         schema: GraphQLSchema,
-        namespace: String
+        namespace: String,
+        scalarMappings: [String: String]
     ) -> String {
         guard !inputObjects.isEmpty else { return "" }
         var output = "public extension \(namespace) {\n"
         for inputObject in inputObjects {
             output += "  struct \(inputObject.name): Encodable, Sendable, GraphQLVariableMapConvertible {\n"
             for field in inputObject.fields {
-                output += "    public var \(escapedIdentifier(field.name)): \(swiftInputType(field.type, schema: schema))\n"
+                output += "    public var \(escapedIdentifier(field.name)): \(swiftInputType(field.type, schema: schema, scalarMappings: scalarMappings))\n"
             }
             output += "\n"
             output += "    public init(\n"
             output += inputObject.fields.enumerated().map { index, field in
                 let defaultValue = field.type.nullable ? " = .none" : ""
                 let suffix = index == inputObject.fields.count - 1 ? "" : ","
-                return "      \(escapedIdentifier(field.name)): \(swiftInputType(field.type, schema: schema))\(defaultValue)\(suffix)"
+                return "      \(escapedIdentifier(field.name)): \(swiftInputType(field.type, schema: schema, scalarMappings: scalarMappings))\(defaultValue)\(suffix)"
             }.joined(separator: "\n")
             output += "\n    ) {\n"
             for field in inputObject.fields {
@@ -100,7 +102,8 @@ struct SwiftCodeGenerator: Sendable {
     private func generateFragments(
         _ fragments: [String: GraphQLFragmentDefinition],
         schema: GraphQLSchema,
-        namespace: String
+        namespace: String,
+        scalarMappings: [String: String]
     ) throws -> String {
         guard !fragments.isEmpty else { return "" }
         var output = "public extension \(namespace) {\n"
@@ -111,7 +114,8 @@ struct SwiftCodeGenerator: Sendable {
                 parentGraphQLType: fragment.typeName,
                 selections: selectionSet.selections,
                 fragments: fragments,
-                schema: schema
+                schema: schema,
+                scalarMappings: scalarMappings
             )
             output += renderSelectionSet(model, indent: 2)
             output += "\n"
@@ -124,7 +128,8 @@ struct SwiftCodeGenerator: Sendable {
         _ operations: [GraphQLOperationDefinition],
         fragments: [String: GraphQLFragmentDefinition],
         schema: GraphQLSchema,
-        namespace: String
+        namespace: String,
+        scalarMappings: [String: String]
     ) throws -> String {
         guard !operations.isEmpty else { return "" }
         var output = "public extension \(namespace) {\n"
@@ -136,7 +141,8 @@ struct SwiftCodeGenerator: Sendable {
                 parentGraphQLType: rootTypeName(for: operation.kind),
                 selections: selectionSet.selections,
                 fragments: fragments,
-                schema: schema
+                schema: schema,
+                scalarMappings: scalarMappings
             )
 
             output += "  struct \(structName): \(operationProtocol(operation.kind)) {\n"
@@ -144,7 +150,7 @@ struct SwiftCodeGenerator: Sendable {
             output += "    public static let document = #\"\"\"\n\(documentSource(for: operation, fragments: fragments))\n\"\"\"#\n\n"
             output += "    public static let selections: [SwiftGraphQLClient.GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
             for variable in operation.variables {
-                output += "    public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema))\n"
+                output += "    public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema, scalarMappings: scalarMappings))\n"
             }
             if !operation.variables.isEmpty {
                 output += "\n"
@@ -152,7 +158,7 @@ struct SwiftCodeGenerator: Sendable {
                 output += operation.variables.enumerated().map { index, variable in
                     let defaultValue = swiftDefaultValue(for: variable, schema: schema)
                     let suffix = index == operation.variables.count - 1 ? "" : ","
-                    return "      \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema))\(defaultValue)\(suffix)"
+                    return "      \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema, scalarMappings: scalarMappings))\(defaultValue)\(suffix)"
                 }.joined(separator: "\n")
                 output += "\n    ) {\n"
                 for variable in operation.variables {
@@ -161,7 +167,7 @@ struct SwiftCodeGenerator: Sendable {
                 output += "    }\n\n"
                 output += "    public struct Variables: Encodable, Sendable, GraphQLVariableMapConvertible {\n"
                 for variable in operation.variables {
-                    output += "      public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema))\n"
+                    output += "      public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema, scalarMappings: scalarMappings))\n"
                 }
                 output += "\n"
                 output += "      public func graphQLVariableMap() throws -> [String: GraphQLJSONValue] {\n"
@@ -285,7 +291,8 @@ struct SwiftCodeGenerator: Sendable {
         parentGraphQLType: String,
         selections: [GraphQLSelection],
         fragments: [String: GraphQLFragmentDefinition],
-        schema: GraphQLSchema
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
     ) throws -> GeneratedSelectionSet {
         let expanded = try expandSelections(
             selections,
@@ -309,7 +316,8 @@ struct SwiftCodeGenerator: Sendable {
                     parentGraphQLType: fieldParentType,
                     selections: field.selections,
                     fragments: fragments,
-                    schema: schema
+                    schema: schema,
+                    scalarMappings: scalarMappings
                 ))
             }
             generatedFields.append(GeneratedField(
@@ -318,7 +326,8 @@ struct SwiftCodeGenerator: Sendable {
                 swiftType: swiftOutputType(
                     effectiveType,
                     nestedTypeName: hasNestedObject ? nestedName : nil,
-                    schema: schema
+                    schema: schema,
+                    scalarMappings: scalarMappings
                 )
             ))
         }
@@ -394,18 +403,20 @@ struct SwiftCodeGenerator: Sendable {
     private func swiftOutputType(
         _ type: GraphQLTypeReference,
         nestedTypeName: String?,
-        schema: GraphQLSchema
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
     ) -> String {
         if case .nonNull(let inner) = type {
-            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema)
+            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings)
         }
-        return swiftNonNullableOutputType(type, nestedTypeName: nestedTypeName, schema: schema) + "?"
+        return swiftNonNullableOutputType(type, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings) + "?"
     }
 
     private func swiftNonNullableOutputType(
         _ type: GraphQLTypeReference,
         nestedTypeName: String?,
-        schema: GraphQLSchema
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
     ) -> String {
         switch type {
         case .named(let name):
@@ -425,24 +436,25 @@ struct SwiftCodeGenerator: Sendable {
             case "Boolean":
                 return "Bool"
             default:
-                return schema.scalars.contains(name) ? name : "GraphQLJSONValue"
+                return scalarMappings[name] ?? (schema.scalars.contains(name) ? name : "GraphQLJSONValue")
             }
         case .list(let inner):
-            return "[\(swiftListElementOutputType(inner, nestedTypeName: nestedTypeName, schema: schema))]"
+            return "[\(swiftListElementOutputType(inner, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings))]"
         case .nonNull(let inner):
-            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema)
+            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings)
         }
     }
 
     private func swiftListElementOutputType(
         _ type: GraphQLTypeReference,
         nestedTypeName: String?,
-        schema: GraphQLSchema
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
     ) -> String {
         if case .nonNull(let inner) = type {
-            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema)
+            return swiftNonNullableOutputType(inner, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings)
         }
-        return swiftNonNullableOutputType(type, nestedTypeName: nestedTypeName, schema: schema) + "?"
+        return swiftNonNullableOutputType(type, nestedTypeName: nestedTypeName, schema: schema, scalarMappings: scalarMappings) + "?"
     }
 
     private func documentSource(
@@ -483,14 +495,22 @@ struct SwiftCodeGenerator: Sendable {
         }
     }
 
-    private func swiftInputType(_ type: GraphQLTypeReference, schema: GraphQLSchema) -> String {
+    private func swiftInputType(
+        _ type: GraphQLTypeReference,
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
+    ) -> String {
         if type.nullable {
-            return "GraphQLNullable<\(swiftNonNullableInputType(type.unwrapped, schema: schema))>"
+            return "GraphQLNullable<\(swiftNonNullableInputType(type.unwrapped, schema: schema, scalarMappings: scalarMappings))>"
         }
-        return swiftNonNullableInputType(type.unwrapped, schema: schema)
+        return swiftNonNullableInputType(type.unwrapped, schema: schema, scalarMappings: scalarMappings)
     }
 
-    private func swiftNonNullableInputType(_ type: GraphQLTypeReference, schema: GraphQLSchema) -> String {
+    private func swiftNonNullableInputType(
+        _ type: GraphQLTypeReference,
+        schema: GraphQLSchema,
+        scalarMappings: [String: String]
+    ) -> String {
         switch type {
         case .named(let name):
             if schema.enums[name] != nil {
@@ -506,12 +526,12 @@ struct SwiftCodeGenerator: Sendable {
             case "Boolean":
                 return "Bool"
             default:
-                return name
+                return scalarMappings[name] ?? name
             }
         case .list(let inner):
-            return "[\(swiftNonNullableInputType(inner.unwrapped, schema: schema))]"
+            return "[\(swiftNonNullableInputType(inner.unwrapped, schema: schema, scalarMappings: scalarMappings))]"
         case .nonNull(let inner):
-            return swiftNonNullableInputType(inner, schema: schema)
+            return swiftNonNullableInputType(inner, schema: schema, scalarMappings: scalarMappings)
         }
     }
 

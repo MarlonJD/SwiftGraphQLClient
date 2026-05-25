@@ -15,6 +15,8 @@ public struct GraphQLClientConfiguration: Sendable {
     public var sessionRefresher: (any GraphQLSessionRefresher)?
     public var subscriptionTransport: (any GraphQLSubscriptionTransport)?
     public var multipartRequestEncoder: (any GraphQLMultipartRequestEncoding)?
+    public var responseCache: (any GraphQLOperationCache)?
+    public var cacheRefreshTaskPriority: TaskPriority
 
     public init(
         endpointURL: URL,
@@ -24,7 +26,9 @@ public struct GraphQLClientConfiguration: Sendable {
         deviceFingerprintHeaderName: String = "X-Device-Fingerprint",
         sessionRefresher: (any GraphQLSessionRefresher)? = nil,
         subscriptionTransport: (any GraphQLSubscriptionTransport)? = nil,
-        multipartRequestEncoder: (any GraphQLMultipartRequestEncoding)? = nil
+        multipartRequestEncoder: (any GraphQLMultipartRequestEncoding)? = nil,
+        responseCache: (any GraphQLOperationCache)? = nil,
+        cacheRefreshTaskPriority: TaskPriority = .utility
     ) {
         self.endpointURL = endpointURL
         self.authProvider = authProvider
@@ -34,6 +38,8 @@ public struct GraphQLClientConfiguration: Sendable {
         self.sessionRefresher = sessionRefresher
         self.subscriptionTransport = subscriptionTransport
         self.multipartRequestEncoder = multipartRequestEncoder
+        self.responseCache = responseCache
+        self.cacheRefreshTaskPriority = cacheRefreshTaskPriority
     }
 }
 
@@ -61,19 +67,39 @@ public final class GraphQLClient: @unchecked Sendable {
         cachePolicy: GraphQLCachePolicy = .networkOnly
     ) async throws -> Query.Data {
         switch cachePolicy {
-        case .networkOnly, .noCache:
-            return try materialize(try await send(query))
-        case .cacheFirst, .cacheOnly, .cacheAndNetwork:
-            throw GraphQLClientError.unsupportedCachePolicy(cachePolicy)
+        case .networkOnly:
+            return try await fetchFromNetwork(query, writesToCache: true)
+        case .noCache:
+            return try await fetchFromNetwork(query, writesToCache: false)
+        case .cacheOnly:
+            return try await fetchFromCache(query)
+        case .cacheFirst:
+            if let cached = try await cachedData(query) {
+                return cached
+            }
+            return try await fetchFromNetwork(query, writesToCache: true)
+        case .cacheAndNetwork:
+            if let cached = try await cachedData(query) {
+                Task(priority: configuration.cacheRefreshTaskPriority) { [self] in
+                    try? await fetchFromNetwork(query, writesToCache: true)
+                }
+                return cached
+            }
+            return try await fetchFromNetwork(query, writesToCache: true)
         }
     }
 
     public func perform<Mutation: GraphQLMutation>(_ mutation: Mutation) async throws -> Mutation.Data {
-        try materialize(try await send(mutation))
+        let execution = try await execute(mutation, didRefresh: false)
+        let data = try materialize(execution.result)
+        if execution.result.errors.isEmpty, let rawData = execution.rawData {
+            try await configuration.responseCache?.write(mutation, data: rawData)
+        }
+        return data
     }
 
     public func send<Operation: GraphQLOperation>(_ operation: Operation) async throws -> GraphQLResult<Operation.Data> {
-        try await execute(operation, didRefresh: false)
+        try await execute(operation, didRefresh: false).result
     }
 
     public func subscribe<Subscription: GraphQLSubscription>(
@@ -97,10 +123,48 @@ public final class GraphQLClient: @unchecked Sendable {
         return data
     }
 
+    private func fetchFromNetwork<Query: GraphQLQuery>(_ query: Query, writesToCache: Bool) async throws -> Query.Data {
+        let execution = try await execute(query, didRefresh: false)
+        let data = try materialize(execution.result)
+        if writesToCache, execution.result.errors.isEmpty, let rawData = execution.rawData {
+            try await configuration.responseCache?.write(query, data: rawData)
+        }
+        return data
+    }
+
+    private func fetchFromCache<Query: GraphQLQuery>(_ query: Query) async throws -> Query.Data {
+        guard let cached = try await cachedResponse(query) else {
+            throw GraphQLClientError.cacheMiss
+        }
+        if cached.isPartial {
+            throw GraphQLClientError.partialCacheHit(missingFields: cached.missingFields)
+        }
+        guard let data = cached.data else {
+            throw GraphQLClientError.cacheMiss
+        }
+        return try GraphQLResponseMaterializer.decode(Query.Data.self, from: data, decoder: decoder)
+    }
+
+    private func cachedData<Query: GraphQLQuery>(_ query: Query) async throws -> Query.Data? {
+        guard let cached = try await cachedResponse(query),
+              !cached.isPartial,
+              let data = cached.data else {
+            return nil
+        }
+        return try GraphQLResponseMaterializer.decode(Query.Data.self, from: data, decoder: decoder)
+    }
+
+    private func cachedResponse<Operation: GraphQLOperation>(_ operation: Operation) async throws -> GraphQLCachedResponse? {
+        guard let cache = configuration.responseCache else { return nil }
+        let cached = try await cache.read(operation)
+        guard cached.data != nil || cached.isPartial else { return nil }
+        return cached
+    }
+
     private func execute<Operation: GraphQLOperation>(
         _ operation: Operation,
         didRefresh: Bool
-    ) async throws -> GraphQLResult<Operation.Data> {
+    ) async throws -> GraphQLExecutionResult<Operation.Data> {
         let request = try await makeRequest(for: operation)
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -118,12 +182,15 @@ public final class GraphQLClient: @unchecked Sendable {
             throw GraphQLClientError.invalidResponse
         }
 
-        let envelope = try decoder.decode(GraphQLResponseEnvelope<Operation.Data>.self, from: data)
-        let result = GraphQLResult(data: envelope.data, errors: envelope.errors ?? [])
+        let envelope = try decoder.decode(GraphQLRawResponseEnvelope.self, from: data)
+        let typedData = try envelope.data.map {
+            try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
+        }
+        let result = GraphQLResult(data: typedData, errors: envelope.errors ?? [])
         if !didRefresh, result.errors.contains(where: { $0.isUnauthorized }), try await refreshSession() {
             return try await execute(operation, didRefresh: true)
         }
-        return result
+        return GraphQLExecutionResult(result: result, rawData: envelope.data)
     }
 
     private func makeRequest<Operation: GraphQLOperation>(for operation: Operation) async throws -> URLRequest {
@@ -168,6 +235,11 @@ public final class GraphQLClient: @unchecked Sendable {
     }
 }
 
+private struct GraphQLExecutionResult<Data: Sendable>: Sendable {
+    let result: GraphQLResult<Data>
+    let rawData: GraphQLJSONValue?
+}
+
 private struct GraphQLRequestBody: Encodable {
     let query: String
     let operationName: String
@@ -189,7 +261,7 @@ private struct GraphQLRequestBody: Encodable {
     }
 }
 
-private struct GraphQLResponseEnvelope<Data: Decodable>: Decodable {
-    let data: Data?
+private struct GraphQLRawResponseEnvelope: Decodable {
+    let data: GraphQLJSONValue?
     let errors: [GraphQLError]?
 }

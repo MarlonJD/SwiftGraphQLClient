@@ -84,4 +84,101 @@ final class GraphQLCacheTests: XCTestCase {
             GraphQLRecord.referenceValue(second)
         ])
     }
+
+    func testNormalizedCacheStoresEntitiesAndPathFallbackObjects() async throws {
+        let cache = GraphQLNormalizedCache(configuration: GraphQLNormalizationConfiguration(
+            customKeyFields: ["Viewer": ["slug"]]
+        ))
+        let query = CacheViewerQuery(slug: "marlon")
+
+        try await cache.write(query, data: .object([
+            "viewer": .object([
+                "__typename": .string("Viewer"),
+                "slug": .string("marlon"),
+                "name": .string("Marlon"),
+                "settings": .object([
+                    "theme": .string("dark")
+                ])
+            ])
+        ]))
+
+        let response = try await cache.read(query)
+        XCTAssertFalse(response.isPartial)
+        XCTAssertEqual(response.data, .object([
+            "viewer": .object([
+                "__typename": .string("Viewer"),
+                "slug": .string("marlon"),
+                "name": .string("Marlon"),
+                "settings": .object([
+                    "theme": .string("dark")
+                ])
+            ])
+        ]))
+    }
+
+    func testNormalizedCacheReportsPartialRootReads() async throws {
+        let cache = GraphQLNormalizedCache()
+        let response = try await cache.read(CacheViewerQuery(slug: "missing"))
+
+        XCTAssertTrue(response.isPartial)
+        XCTAssertNil(response.data)
+        XCTAssertEqual(response.missingFields, ["viewer"])
+    }
+
+    func testNormalizedCacheReportsPartialNestedReads() async throws {
+        let cache = GraphQLNormalizedCache()
+        let query = CacheViewerQuery(slug: "marlon")
+
+        try await cache.write(query, data: .object([
+            "viewer": .object([
+                "__typename": .string("Viewer"),
+                "slug": .string("marlon"),
+                "name": .string("Marlon")
+            ])
+        ]))
+
+        let response = try await cache.read(query)
+
+        XCTAssertTrue(response.isPartial)
+        XCTAssertEqual(response.missingFields, ["viewer.settings"])
+    }
+}
+
+private struct CacheViewerQuery: GraphQLQuery {
+    static let operationName = "CacheViewer"
+    static let document = "query CacheViewer($slug: String!) { viewer(slug: $slug) { __typename slug name settings { theme } } }"
+    static let selections: [GraphQLSelection] = [
+        .field(name: "viewer", responseName: "viewer", selections: [
+            .field(name: "__typename", responseName: "__typename", selections: []),
+            .field(name: "slug", responseName: "slug", selections: []),
+            .field(name: "name", responseName: "name", selections: []),
+            .field(name: "settings", responseName: "settings", selections: [
+                .field(name: "theme", responseName: "theme", selections: [])
+            ])
+        ])
+    ]
+
+    struct Variables: Encodable, Sendable {
+        let slug: String
+    }
+
+    struct Data: Codable, Sendable, Equatable {
+        struct Viewer: Codable, Sendable, Equatable {
+            struct Settings: Codable, Sendable, Equatable {
+                let theme: String
+            }
+
+            let slug: String
+            let name: String
+            let settings: Settings
+        }
+
+        let viewer: Viewer
+    }
+
+    let slug: String
+
+    var variables: Variables {
+        Variables(slug: slug)
+    }
 }

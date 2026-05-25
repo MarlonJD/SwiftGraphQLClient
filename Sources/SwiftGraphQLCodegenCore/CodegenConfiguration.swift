@@ -5,17 +5,20 @@ public struct CodegenConfiguration: Equatable, Sendable {
     public var schemaSearchPaths: [String]
     public var operationSearchPaths: [String]
     public var outputPath: String
+    public var scalarMappings: [String: String]
 
     public init(
         namespace: String,
         schemaSearchPaths: [String],
         operationSearchPaths: [String],
-        outputPath: String
+        outputPath: String,
+        scalarMappings: [String: String] = [:]
     ) {
         self.namespace = namespace
         self.schemaSearchPaths = schemaSearchPaths
         self.operationSearchPaths = operationSearchPaths
         self.outputPath = outputPath
+        self.scalarMappings = scalarMappings
     }
 
     public static func load(from url: URL) throws -> CodegenConfiguration {
@@ -39,7 +42,8 @@ public struct CodegenConfiguration: Equatable, Sendable {
             namespace: namespace,
             schemaSearchPaths: input?["schemaSearchPaths"] as? [String] ?? [],
             operationSearchPaths: input?["operationSearchPaths"] as? [String] ?? [],
-            outputPath: schemaTypes?["path"] as? String ?? "./GeneratedGraphQL"
+            outputPath: schemaTypes?["path"] as? String ?? "./GeneratedGraphQL",
+            scalarMappings: object["scalarMappings"] as? [String: String] ?? object["scalars"] as? [String: String] ?? [:]
         )
     }
 
@@ -48,6 +52,7 @@ public struct CodegenConfiguration: Equatable, Sendable {
         var schemaSearchPaths: [String] = []
         var operationSearchPaths: [String] = []
         var outputPath: String?
+        var scalarMappings: [String: String] = [:]
         var listKey: String?
         var sectionStack: [String] = []
 
@@ -73,6 +78,15 @@ public struct CodegenConfiguration: Equatable, Sendable {
             if let colon = line.firstIndex(of: ":") {
                 let key = String(line[..<colon])
                 let value = cleanScalar(String(line[line.index(after: colon)...]))
+                if indent > 0,
+                   sectionStack.contains("scalars") || sectionStack.contains("scalarMappings") || sectionStack.contains("customScalars") {
+                    if !value.isEmpty {
+                        scalarMappings[key] = value
+                    }
+                    listKey = nil
+                    continue
+                }
+
                 if indent == 0 {
                     sectionStack = [key]
                 } else {
@@ -99,6 +113,8 @@ public struct CodegenConfiguration: Equatable, Sendable {
                 case "output":
                     if !value.isEmpty { outputPath = value }
                     listKey = nil
+                case "scalars", "scalarMappings", "customScalars":
+                    listKey = nil
                 case "path":
                     if sectionStack.contains("output") || sectionStack.contains("schemaTypes") {
                         outputPath = value
@@ -121,7 +137,8 @@ public struct CodegenConfiguration: Equatable, Sendable {
             namespace: namespace,
             schemaSearchPaths: schemaSearchPaths,
             operationSearchPaths: operationSearchPaths,
-            outputPath: outputPath ?? "./GeneratedGraphQL"
+            outputPath: outputPath ?? "./GeneratedGraphQL",
+            scalarMappings: scalarMappings
         )
     }
 

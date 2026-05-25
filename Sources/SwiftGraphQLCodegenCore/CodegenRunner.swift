@@ -18,7 +18,8 @@ public enum CodegenRunner {
         let swift = try SwiftCodeGenerator().generate(
             namespace: configuration.namespace,
             schema: schema,
-            documents: documents
+            documents: documents,
+            scalarMappings: configuration.scalarMappings
         )
 
         let outputURL: URL
