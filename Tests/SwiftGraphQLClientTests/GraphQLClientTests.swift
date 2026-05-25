@@ -262,9 +262,139 @@ final class GraphQLClientTests: XCTestCase {
         XCTAssertTrue(data.upload.ok)
     }
 
-    private static func response(statusCode: Int, body: String) -> (Data, URLResponse) {
+    func testAutomaticPersistedQueriesRetryWithFullDocument() async throws {
+        let session = SequencedRecordingSession(responses: [
+            Self.response(
+                statusCode: 200,
+                body: #"{"errors":[{"message":"PersistedQueryNotFound","extensions":{"code":"PERSISTED_QUERY_NOT_FOUND"}}]}"#
+            ),
+            Self.response(
+                statusCode: 200,
+                body: #"{"data":{"viewer":{"id":"user-1","name":"Persisted"}}}"#
+            )
+        ])
+        let client = GraphQLClient(
+            configuration: GraphQLClientConfiguration(
+                endpointURL: URL(string: "https://example.com/graphql")!,
+                persistedQueries: .automaticPersistedQueries()
+            ),
+            session: session
+        )
+
+        let data = try await client.fetch(ViewerQuery(id: "user-1"))
+        let requests = await session.requests
+
+        XCTAssertEqual(data.viewer.name, "Persisted")
+        XCTAssertEqual(requests.count, 2)
+
+        let firstJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(requests[0].httpBody)) as? [String: Any])
+        XCTAssertNil(firstJSON["query"])
+        XCTAssertEqual(firstJSON["operationName"] as? String, "Viewer")
+        let extensions = try XCTUnwrap(firstJSON["extensions"] as? [String: Any])
+        let persistedQuery = try XCTUnwrap(extensions["persistedQuery"] as? [String: Any])
+        XCTAssertEqual(persistedQuery["sha256Hash"] as? String, ViewerQuery.operationIdentifier)
+
+        let secondJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(requests[1].httpBody)) as? [String: Any])
+        XCTAssertEqual(secondJSON["query"] as? String, ViewerQuery.document)
+    }
+
+    func testRequestAndResponseInterceptorsRunAroundHTTPExecution() async throws {
+        let session = RecordingSession { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Trace"), "trace-1")
+            return Self.response(
+                statusCode: 200,
+                body: #"{"data":{"viewer":{"id":"user-1","name":"Before"}}}"#
+            )
+        }
+        let client = GraphQLClient(
+            configuration: GraphQLClientConfiguration(
+                endpointURL: URL(string: "https://example.com/graphql")!,
+                requestInterceptors: [GraphQLHeaderInterceptor(headers: ["X-Trace": "trace-1"])],
+                responseInterceptors: [ReplacingNameResponseInterceptor()]
+            ),
+            session: session
+        )
+
+        let data = try await client.fetch(ViewerQuery(id: "user-1"))
+
+        XCTAssertEqual(data.viewer.name, "After")
+    }
+
+    func testFetchIncrementalParsesMultipartResponses() async throws {
+        let body = """
+        --graphql
+        Content-Type: application/json
+
+        {"data":{"viewer":{"id":"user-1","name":"Initial"}},"hasNext":true}
+        --graphql
+        Content-Type: application/json
+
+        {"incremental":[{"label":"MoreViewer","path":["viewer"],"data":{"nickname":"MJ"}}],"hasNext":false}
+        --graphql--
+        """
+        let session = RecordingSession { _ in
+            Self.response(
+                statusCode: 200,
+                body: body,
+                headers: ["Content-Type": "multipart/mixed; boundary=graphql"]
+            )
+        }
+        let client = GraphQLClient(
+            configuration: GraphQLClientConfiguration(endpointURL: URL(string: "https://example.com/graphql")!),
+            session: session
+        )
+
+        var values: [GraphQLIncrementalResult<ViewerQuery.Data>] = []
+        for try await value in client.fetchIncremental(ViewerQuery(id: "user-1")) {
+            values.append(value)
+        }
+
+        XCTAssertEqual(values.count, 2)
+        XCTAssertEqual(values.first?.data?.viewer.name, "Initial")
+        XCTAssertEqual(values.first?.hasNext, true)
+        XCTAssertEqual(values.last?.patches.first?.label, "MoreViewer")
+        XCTAssertEqual(values.last?.hasNext, false)
+    }
+
+    func testHTTPSubscriptionTransportParsesMultipartResponses() async throws {
+        let body = """
+        --graphql
+        Content-Type: application/json
+
+        {"data":{"message":{"text":"one"}},"hasNext":true}
+        --graphql
+        Content-Type: application/json
+
+        {"data":{"message":{"text":"two"}},"hasNext":false}
+        --graphql--
+        """
+        let transport = GraphQLHTTPSubscriptionTransport(
+            endpointURL: URL(string: "https://example.com/graphql")!,
+            session: RecordingSession { request in
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/graphql-response+json, multipart/mixed, application/json;q=0.9")
+                return Self.response(
+                    statusCode: 200,
+                    body: body,
+                    headers: ["Content-Type": "multipart/mixed; boundary=graphql"]
+                )
+            }
+        )
+
+        var messages: [String] = []
+        for try await value in transport.subscribe(MessageSubscription()) {
+            messages.append(value.message.text)
+        }
+
+        XCTAssertEqual(messages, ["one", "two"])
+    }
+
+    private static func response(
+        statusCode: Int,
+        body: String,
+        headers: [String: String]? = nil
+    ) -> (Data, URLResponse) {
         let url = URL(string: "https://example.com/graphql")!
-        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
+        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: headers)!
         return (Data(body.utf8), response)
     }
 }
@@ -410,6 +540,20 @@ private final class RecordingSession: GraphQLURLSession, @unchecked Sendable {
     }
 }
 
+private actor SequencedRecordingSession: GraphQLURLSession {
+    private var responses: [(Data, URLResponse)]
+    private(set) var requests: [URLRequest] = []
+
+    init(responses: [(Data, URLResponse)]) {
+        self.responses = responses
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        requests.append(request)
+        return responses.removeFirst()
+    }
+}
+
 private actor SequencedSession: GraphQLURLSession {
     private var responses: [(Data, URLResponse)]
     private(set) var count = 0
@@ -421,6 +565,18 @@ private actor SequencedSession: GraphQLURLSession {
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         count += 1
         return responses.removeFirst()
+    }
+}
+
+private struct ReplacingNameResponseInterceptor: GraphQLResponseInterceptor {
+    func intercept(
+        data: Data,
+        response: HTTPURLResponse,
+        context: GraphQLRequestContext
+    ) async throws -> (Data, HTTPURLResponse) {
+        let replaced = String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: "Before", with: "After")
+        return (Data(replaced.utf8), response)
     }
 }
 

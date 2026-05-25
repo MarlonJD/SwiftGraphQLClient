@@ -6,19 +6,22 @@ public struct CodegenConfiguration: Equatable, Sendable {
     public var operationSearchPaths: [String]
     public var outputPath: String
     public var scalarMappings: [String: String]
+    public var operationManifestPath: String?
 
     public init(
         namespace: String,
         schemaSearchPaths: [String],
         operationSearchPaths: [String],
         outputPath: String,
-        scalarMappings: [String: String] = [:]
+        scalarMappings: [String: String] = [:],
+        operationManifestPath: String? = nil
     ) {
         self.namespace = namespace
         self.schemaSearchPaths = schemaSearchPaths
         self.operationSearchPaths = operationSearchPaths
         self.outputPath = outputPath
         self.scalarMappings = scalarMappings
+        self.operationManifestPath = operationManifestPath
     }
 
     public static func load(from url: URL) throws -> CodegenConfiguration {
@@ -43,7 +46,8 @@ public struct CodegenConfiguration: Equatable, Sendable {
             schemaSearchPaths: input?["schemaSearchPaths"] as? [String] ?? [],
             operationSearchPaths: input?["operationSearchPaths"] as? [String] ?? [],
             outputPath: schemaTypes?["path"] as? String ?? "./GeneratedGraphQL",
-            scalarMappings: object["scalarMappings"] as? [String: String] ?? object["scalars"] as? [String: String] ?? [:]
+            scalarMappings: object["scalarMappings"] as? [String: String] ?? object["scalars"] as? [String: String] ?? [:],
+            operationManifestPath: (object["operationManifest"] as? [String: Any])?["path"] as? String
         )
     }
 
@@ -53,6 +57,7 @@ public struct CodegenConfiguration: Equatable, Sendable {
         var operationSearchPaths: [String] = []
         var outputPath: String?
         var scalarMappings: [String: String] = [:]
+        var operationManifestPath: String?
         var listKey: String?
         var sectionStack: [String] = []
 
@@ -113,11 +118,16 @@ public struct CodegenConfiguration: Equatable, Sendable {
                 case "output":
                     if !value.isEmpty { outputPath = value }
                     listKey = nil
+                case "operationManifest":
+                    if !value.isEmpty { operationManifestPath = value }
+                    listKey = nil
                 case "scalars", "scalarMappings", "customScalars":
                     listKey = nil
                 case "path":
                     if sectionStack.contains("output") || sectionStack.contains("schemaTypes") {
                         outputPath = value
+                    } else if sectionStack.contains("operationManifest") {
+                        operationManifestPath = value
                     }
                     listKey = nil
                 default:
@@ -138,7 +148,8 @@ public struct CodegenConfiguration: Equatable, Sendable {
             schemaSearchPaths: schemaSearchPaths,
             operationSearchPaths: operationSearchPaths,
             outputPath: outputPath ?? "./GeneratedGraphQL",
-            scalarMappings: scalarMappings
+            scalarMappings: scalarMappings,
+            operationManifestPath: operationManifestPath
         )
     }
 

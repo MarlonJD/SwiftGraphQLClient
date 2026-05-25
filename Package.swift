@@ -15,6 +15,8 @@ let package = Package(
         .library(name: "SwiftGraphQLUpload", targets: ["SwiftGraphQLUpload"]),
         .library(name: "SwiftGraphQLWebSocket", targets: ["SwiftGraphQLWebSocket"]),
         .library(name: "SwiftGraphQLAppSync", targets: ["SwiftGraphQLAppSync"]),
+        .library(name: "SwiftGraphQLPagination", targets: ["SwiftGraphQLPagination"]),
+        .library(name: "SwiftGraphQLTestSupport", targets: ["SwiftGraphQLTestSupport"]),
         .executable(name: "swift-graphql", targets: ["swift-graphql-codegen"]),
         .executable(name: "swift-graphql-codegen", targets: ["swift-graphql-codegen"]),
         .plugin(name: "SwiftGraphQLCodegenPlugin", targets: ["SwiftGraphQLCodegenPlugin"])
@@ -43,6 +45,14 @@ let package = Package(
             dependencies: ["SwiftGraphQLClient", "SwiftGraphQLWebSocket"]
         ),
         .target(
+            name: "SwiftGraphQLPagination",
+            dependencies: ["SwiftGraphQLClient"]
+        ),
+        .target(
+            name: "SwiftGraphQLTestSupport",
+            dependencies: ["SwiftGraphQLClient"]
+        ),
+        .target(
             name: "SwiftGraphQLCodegenCore",
             dependencies: ["SwiftGraphQLClient"]
         ),
@@ -57,7 +67,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftGraphQLClientTests",
-            dependencies: ["SwiftGraphQLClient", "SwiftGraphQLCodegenCore", "SwiftGraphQLUpload", "SwiftGraphQLWebSocket", "SwiftGraphQLAppSync", "SwiftGraphQLCache", "SwiftGraphQLSQLiteStore"]
+            dependencies: ["SwiftGraphQLClient", "SwiftGraphQLCodegenCore", "SwiftGraphQLUpload", "SwiftGraphQLWebSocket", "SwiftGraphQLAppSync", "SwiftGraphQLCache", "SwiftGraphQLSQLiteStore", "SwiftGraphQLPagination", "SwiftGraphQLTestSupport"]
         )
     ]
 )

@@ -1,4 +1,5 @@
 import Foundation
+import SwiftGraphQLClient
 
 struct SwiftCodeGenerator: Sendable {
     init() {}
@@ -147,6 +148,7 @@ struct SwiftCodeGenerator: Sendable {
 
             output += "  struct \(structName): \(operationProtocol(operation.kind)) {\n"
             output += "    public static let operationName = \"\(operation.name)\"\n"
+            output += "    public static let operationIdentifier = \"\(GraphQLOperationDocumentHasher.sha256(documentSource(for: operation, fragments: fragments)))\"\n"
             output += "    public static let document = #\"\"\"\n\(documentSource(for: operation, fragments: fragments))\n\"\"\"#\n\n"
             output += "    public static let selections: [SwiftGraphQLClient.GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
             let fragmentMetadata = try renderFragmentMetadataMap(names: operation.fragmentSpreads, fragments: fragments, indent: 4)

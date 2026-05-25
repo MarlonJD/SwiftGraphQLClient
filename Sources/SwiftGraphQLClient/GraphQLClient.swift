@@ -17,6 +17,9 @@ public struct GraphQLClientConfiguration: Sendable {
     public var multipartRequestEncoder: (any GraphQLMultipartRequestEncoding)?
     public var responseCache: (any GraphQLOperationCache)?
     public var cacheRefreshTaskPriority: TaskPriority
+    public var persistedQueries: GraphQLPersistedQueryConfiguration
+    public var requestInterceptors: [any GraphQLRequestInterceptor]
+    public var responseInterceptors: [any GraphQLResponseInterceptor]
 
     public init(
         endpointURL: URL,
@@ -28,7 +31,10 @@ public struct GraphQLClientConfiguration: Sendable {
         subscriptionTransport: (any GraphQLSubscriptionTransport)? = nil,
         multipartRequestEncoder: (any GraphQLMultipartRequestEncoding)? = nil,
         responseCache: (any GraphQLOperationCache)? = nil,
-        cacheRefreshTaskPriority: TaskPriority = .utility
+        cacheRefreshTaskPriority: TaskPriority = .utility,
+        persistedQueries: GraphQLPersistedQueryConfiguration = .disabled,
+        requestInterceptors: [any GraphQLRequestInterceptor] = [],
+        responseInterceptors: [any GraphQLResponseInterceptor] = []
     ) {
         self.endpointURL = endpointURL
         self.authProvider = authProvider
@@ -40,6 +46,9 @@ public struct GraphQLClientConfiguration: Sendable {
         self.multipartRequestEncoder = multipartRequestEncoder
         self.responseCache = responseCache
         self.cacheRefreshTaskPriority = cacheRefreshTaskPriority
+        self.persistedQueries = persistedQueries
+        self.requestInterceptors = requestInterceptors
+        self.responseInterceptors = responseInterceptors
     }
 }
 
@@ -90,7 +99,7 @@ public final class GraphQLClient: @unchecked Sendable {
     }
 
     public func perform<Mutation: GraphQLMutation>(_ mutation: Mutation) async throws -> Mutation.Data {
-        let execution = try await execute(mutation, didRefresh: false)
+        let execution = try await execute(mutation, didRefresh: false, didPersistedQueryRetry: false)
         let data = try materialize(execution.result)
         if execution.result.errors.isEmpty, let rawData = execution.rawData {
             try await configuration.responseCache?.write(mutation, data: rawData)
@@ -99,7 +108,25 @@ public final class GraphQLClient: @unchecked Sendable {
     }
 
     public func send<Operation: GraphQLOperation>(_ operation: Operation) async throws -> GraphQLResult<Operation.Data> {
-        try await execute(operation, didRefresh: false).result
+        try await execute(operation, didRefresh: false, didPersistedQueryRetry: false).result
+    }
+
+    public func fetchIncremental<Query: GraphQLQuery>(
+        _ query: Query
+    ) -> AsyncThrowingStream<GraphQLIncrementalResult<Query.Data>, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let results = try await executeIncremental(query)
+                    for result in results {
+                        continuation.yield(result)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 
     public func subscribe<Subscription: GraphQLSubscription>(
@@ -124,7 +151,7 @@ public final class GraphQLClient: @unchecked Sendable {
     }
 
     private func fetchFromNetwork<Query: GraphQLQuery>(_ query: Query, writesToCache: Bool) async throws -> Query.Data {
-        let execution = try await execute(query, didRefresh: false)
+        let execution = try await execute(query, didRefresh: false, didPersistedQueryRetry: false)
         let data = try materialize(execution.result)
         if writesToCache, execution.result.errors.isEmpty, let rawData = execution.rawData {
             try await configuration.responseCache?.write(query, data: rawData)
@@ -163,20 +190,41 @@ public final class GraphQLClient: @unchecked Sendable {
 
     private func execute<Operation: GraphQLOperation>(
         _ operation: Operation,
-        didRefresh: Bool
+        didRefresh: Bool,
+        didPersistedQueryRetry: Bool
     ) async throws -> GraphQLExecutionResult<Operation.Data> {
-        let request = try await makeRequest(for: operation)
-        let (data, response) = try await session.data(for: request)
+        let documentMode = requestDocumentMode(didPersistedQueryRetry: didPersistedQueryRetry)
+        let context = GraphQLRequestContext(
+            operationName: Operation.operationName,
+            operationIdentifier: Operation.operationIdentifier,
+            documentMode: documentMode,
+            isRetry: didRefresh || didPersistedQueryRetry
+        )
+        let request = try await makeRequest(
+            for: operation,
+            documentMode: documentMode,
+            useGET: configuration.persistedQueries.useGETForRetry && didPersistedQueryRetry
+        )
+        let (rawData, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw GraphQLClientError.invalidResponse
         }
-
-        if httpResponse.statusCode == 401, !didRefresh, try await refreshSession() {
-            return try await execute(operation, didRefresh: true)
+        var data = rawData
+        var interceptedResponse = httpResponse
+        for interceptor in configuration.responseInterceptors {
+            (data, interceptedResponse) = try await interceptor.intercept(
+                data: data,
+                response: interceptedResponse,
+                context: context
+            )
         }
 
-        guard (200...299).contains(httpResponse.statusCode) else {
-            throw GraphQLClientError.httpStatus(statusCode: httpResponse.statusCode, body: data.isEmpty ? nil : data)
+        if interceptedResponse.statusCode == 401, !didRefresh, try await refreshSession() {
+            return try await execute(operation, didRefresh: true, didPersistedQueryRetry: didPersistedQueryRetry)
+        }
+
+        guard (200...299).contains(interceptedResponse.statusCode) else {
+            throw GraphQLClientError.httpStatus(statusCode: interceptedResponse.statusCode, body: data.isEmpty ? nil : data)
         }
         guard !data.isEmpty else {
             throw GraphQLClientError.invalidResponse
@@ -187,15 +235,67 @@ public final class GraphQLClient: @unchecked Sendable {
             try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
         }
         let result = GraphQLResult(data: typedData, errors: envelope.errors ?? [])
+        if !didPersistedQueryRetry, shouldRetryPersistedQuery(result.errors) {
+            return try await execute(operation, didRefresh: didRefresh, didPersistedQueryRetry: true)
+        }
         if !didRefresh, result.errors.contains(where: { $0.isUnauthorized }), try await refreshSession() {
-            return try await execute(operation, didRefresh: true)
+            return try await execute(operation, didRefresh: true, didPersistedQueryRetry: didPersistedQueryRetry)
         }
         return GraphQLExecutionResult(result: result, rawData: envelope.data)
     }
 
-    private func makeRequest<Operation: GraphQLOperation>(for operation: Operation) async throws -> URLRequest {
+    private func executeIncremental<Operation: GraphQLOperation>(
+        _ operation: Operation
+    ) async throws -> [GraphQLIncrementalResult<Operation.Data>] {
+        let documentMode = requestDocumentMode(didPersistedQueryRetry: false)
+        let context = GraphQLRequestContext(
+            operationName: Operation.operationName,
+            operationIdentifier: Operation.operationIdentifier,
+            documentMode: documentMode,
+            isRetry: false
+        )
+        let request = try await makeRequest(for: operation, documentMode: documentMode, useGET: false)
+        let (rawData, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw GraphQLClientError.invalidResponse
+        }
+        var data = rawData
+        var interceptedResponse = httpResponse
+        for interceptor in configuration.responseInterceptors {
+            (data, interceptedResponse) = try await interceptor.intercept(
+                data: data,
+                response: interceptedResponse,
+                context: context
+            )
+        }
+        guard (200...299).contains(interceptedResponse.statusCode) else {
+            throw GraphQLClientError.httpStatus(statusCode: interceptedResponse.statusCode, body: data.isEmpty ? nil : data)
+        }
+        let parts = GraphQLHTTPMultipartResponseParser.responseParts(
+            data: data,
+            contentType: interceptedResponse.value(forHTTPHeaderField: "Content-Type")
+        )
+        return try parts.map { part in
+            let envelope = try decoder.decode(GraphQLRawResponseEnvelope.self, from: part)
+            let typedData = try envelope.data.map {
+                try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
+            }
+            return GraphQLIncrementalResult(
+                data: typedData,
+                errors: envelope.errors ?? [],
+                patches: envelope.incremental?.map(\.patch) ?? [],
+                hasNext: envelope.hasNext
+            )
+        }
+    }
+
+    private func makeRequest<Operation: GraphQLOperation>(
+        for operation: Operation,
+        documentMode: GraphQLRequestDocumentMode,
+        useGET: Bool
+    ) async throws -> URLRequest {
         var request = URLRequest(url: configuration.endpointURL)
-        request.httpMethod = "POST"
+        request.httpMethod = useGET ? "GET" : "POST"
         request.setValue("application/graphql-response+json, application/json;q=0.9", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -212,19 +312,25 @@ public final class GraphQLClient: @unchecked Sendable {
         }
 
         if let multipartRequestEncoder = configuration.multipartRequestEncoder,
+           documentMode == .fullDocument,
            let multipartRequestBody = try multipartRequestEncoder.multipartRequestBody(for: operation) {
             request.setValue(multipartRequestBody.contentType, forHTTPHeaderField: "Content-Type")
             request.httpBody = multipartRequestBody.body
-            return request
+            return try await intercept(request, for: operation, documentMode: documentMode, isRetry: false)
         }
 
         let body = GraphQLRequestBody(
-            query: Operation.document,
+            query: documentMode == .fullDocument ? Operation.document : nil,
             operationName: Operation.operationName,
-            variables: try GraphQLJSONEncoder.variableObject(from: operation.variables)
+            variables: try GraphQLJSONEncoder.variableObject(from: operation.variables),
+            extensions: persistedQueryExtensions(for: Operation.self)
         )
-        request.httpBody = try encoder.encode(body)
-        return request
+        if useGET {
+            request.url = try getURL(for: request.url, body: body)
+        } else {
+            request.httpBody = try encoder.encode(body)
+        }
+        return try await intercept(request, for: operation, documentMode: documentMode, isRetry: useGET)
     }
 
     private func refreshSession() async throws -> Bool {
@@ -232,6 +338,79 @@ public final class GraphQLClient: @unchecked Sendable {
         return try await refreshCoordinator.refresh {
             try await sessionRefresher.refreshSession()
         }
+    }
+
+    private func requestDocumentMode(didPersistedQueryRetry: Bool) -> GraphQLRequestDocumentMode {
+        switch configuration.persistedQueries.mode {
+        case .disabled:
+            return .fullDocument
+        case .automaticPersistedQueries, .persistedQueries:
+            return didPersistedQueryRetry ? .fullDocument : .operationIdentifierOnly
+        }
+    }
+
+    private func persistedQueryExtensions<Operation: GraphQLOperation>(
+        for operation: Operation.Type
+    ) -> GraphQLJSONValue? {
+        guard configuration.persistedQueries.mode != .disabled else { return nil }
+        return .object([
+            "persistedQuery": .object([
+                "version": .int(1),
+                "sha256Hash": .string(Operation.operationIdentifier)
+            ])
+        ])
+    }
+
+    private func shouldRetryPersistedQuery(_ errors: [GraphQLError]) -> Bool {
+        guard errors.contains(where: \.isPersistedQueryNotFound) else { return false }
+        switch configuration.persistedQueries.mode {
+        case .disabled:
+            return false
+        case .automaticPersistedQueries:
+            return true
+        case .persistedQueries:
+            return configuration.persistedQueries.sendsDocumentOnFallback
+        }
+    }
+
+    private func getURL(for url: URL?, body: GraphQLRequestBody) throws -> URL {
+        guard let url else { throw GraphQLClientError.invalidResponse }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var items = components?.queryItems ?? []
+        if let query = body.query {
+            items.append(URLQueryItem(name: "query", value: query))
+        }
+        items.append(URLQueryItem(name: "operationName", value: body.operationName))
+        if let variables = body.variables {
+            let data = try encoder.encode(variables)
+            items.append(URLQueryItem(name: "variables", value: String(decoding: data, as: UTF8.self)))
+        }
+        if let extensions = body.extensions {
+            let data = try encoder.encode(extensions)
+            items.append(URLQueryItem(name: "extensions", value: String(decoding: data, as: UTF8.self)))
+        }
+        components?.queryItems = items
+        guard let finalURL = components?.url else { throw GraphQLClientError.invalidResponse }
+        return finalURL
+    }
+
+    private func intercept<Operation: GraphQLOperation>(
+        _ request: URLRequest,
+        for operation: Operation,
+        documentMode: GraphQLRequestDocumentMode,
+        isRetry: Bool
+    ) async throws -> URLRequest {
+        var request = request
+        let context = GraphQLRequestContext(
+            operationName: Operation.operationName,
+            operationIdentifier: Operation.operationIdentifier,
+            documentMode: documentMode,
+            isRetry: isRetry
+        )
+        for interceptor in configuration.requestInterceptors {
+            request = try await interceptor.intercept(request, context: context)
+        }
+        return request
     }
 }
 
@@ -241,27 +420,29 @@ private struct GraphQLExecutionResult<Data: Sendable>: Sendable {
 }
 
 private struct GraphQLRequestBody: Encodable {
-    let query: String
+    let query: String?
     let operationName: String
     let variables: GraphQLJSONValue?
+    let extensions: GraphQLJSONValue?
 
     enum CodingKeys: String, CodingKey {
         case query
         case operationName
         case variables
+        case extensions
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(query, forKey: .query)
+        if let query {
+            try container.encode(query, forKey: .query)
+        }
         try container.encode(operationName, forKey: .operationName)
         if let variables {
             try container.encode(variables, forKey: .variables)
         }
+        if let extensions {
+            try container.encode(extensions, forKey: .extensions)
+        }
     }
-}
-
-private struct GraphQLRawResponseEnvelope: Decodable {
-    let data: GraphQLJSONValue?
-    let errors: [GraphQLError]?
 }

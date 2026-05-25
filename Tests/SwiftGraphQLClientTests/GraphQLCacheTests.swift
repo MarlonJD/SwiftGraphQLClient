@@ -142,6 +142,62 @@ final class GraphQLCacheTests: XCTestCase {
         XCTAssertTrue(response.isPartial)
         XCTAssertEqual(response.missingFields, ["viewer.settings"])
     }
+
+    func testProgrammaticCacheKeyResolverTakesPrecedence() async throws {
+        let store = GraphQLMemoryStore()
+        let cache = GraphQLNormalizedCache(
+            store: store,
+            configuration: GraphQLNormalizationConfiguration(
+                programmaticCacheKeyResolver: SlugCacheKeyResolver()
+            )
+        )
+
+        try await cache.write(CacheViewerQuery(slug: "marlon"), data: .object([
+            "viewer": .object([
+                "__typename": .string("Viewer"),
+                "slug": .string("marlon"),
+                "name": .string("Marlon"),
+                "settings": .object(["theme": .string("dark")])
+            ])
+        ]))
+
+        let record = await store.read(GraphQLRecordID(rawValue: "ViewerSlug:marlon"))
+
+        XCTAssertEqual(record?.fields["name"], .string("Marlon"))
+    }
+
+    func testTrimEvictsOldestRecords() async {
+        let store = GraphQLMemoryStore()
+        let first = GraphQLRecordID(typename: "Message", id: "1")
+        let second = GraphQLRecordID(typename: "Message", id: "2")
+        let third = GraphQLRecordID(typename: "Message", id: "3")
+
+        await store.write(GraphQLRecord(id: first, fields: ["text": .string("one")]))
+        await store.write(GraphQLRecord(id: second, fields: ["text": .string("two")]))
+        await store.write(GraphQLRecord(id: third, fields: ["text": .string("three")]))
+
+        let evicted = await store.trim(maxRecordCount: 2)
+        let ids = await store.recordIDs()
+
+        XCTAssertEqual(evicted, [first])
+        XCTAssertEqual(ids, [second, third])
+    }
+
+    func testOperationCacheStoreUpdatesQueryDataTransactionally() async throws {
+        let cache = GraphQLNormalizedCache()
+        let store = GraphQLOperationCacheStore(cache: cache)
+        let query = CounterQuery()
+
+        try await cache.write(query, data: .object(["counter": .object(["value": .int(1)])]))
+        let value = try await store.withinReadWriteTransaction { transaction in
+            try await transaction.update(query) { data in
+                data.counter.value += 1
+            }
+            return try await transaction.read(query).counter.value
+        }
+
+        XCTAssertEqual(value, 2)
+    }
 }
 
 private struct CacheViewerQuery: GraphQLQuery {
@@ -185,5 +241,33 @@ private struct CacheViewerQuery: GraphQLQuery {
 
     var variables: Variables {
         Variables(slug: slug)
+    }
+}
+
+private struct SlugCacheKeyResolver: GraphQLProgrammaticCacheKeyResolver {
+    func cacheKey(
+        forTypename typename: String,
+        object: [String: GraphQLJSONValue]
+    ) -> GraphQLRecordID? {
+        guard typename == "Viewer", let slug = object["slug"]?.stringValue else { return nil }
+        return GraphQLRecordID(rawValue: "ViewerSlug:\(slug)")
+    }
+}
+
+private struct CounterQuery: GraphQLQuery {
+    static let operationName = "Counter"
+    static let document = "query Counter { counter { value } }"
+    static let selections: [GraphQLSelection] = [
+        .field(name: "counter", responseName: "counter", selections: [
+            .field(name: "value", responseName: "value", selections: [])
+        ])
+    ]
+
+    struct Data: Codable, Sendable, Equatable {
+        struct Counter: Codable, Sendable, Equatable {
+            var value: Int
+        }
+
+        var counter: Counter
     }
 }

@@ -7,6 +7,7 @@ public protocol GraphQLOperation: Sendable {
 
     static var operationName: String { get }
     static var document: String { get }
+    static var operationIdentifier: String { get }
     static var selections: [GraphQLSelection] { get }
     static var fragments: [String: [GraphQLSelection]] { get }
     var variables: Variables { get }

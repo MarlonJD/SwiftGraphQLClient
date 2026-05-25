@@ -55,6 +55,13 @@ public struct GraphQLCacheReadResult: Equatable, Sendable {
     }
 }
 
+public protocol GraphQLProgrammaticCacheKeyResolver: Sendable {
+    func cacheKey(
+        forTypename typename: String,
+        object: [String: GraphQLJSONValue]
+    ) -> GraphQLRecordID?
+}
+
 public struct GraphQLOptimisticLayerID: RawRepresentable, Hashable, Sendable, Codable, CustomStringConvertible {
     public var rawValue: String
 
@@ -77,13 +84,17 @@ public actor GraphQLMemoryStore {
     }
 
     private var records: [GraphQLRecordID: GraphQLRecord] = [:]
+    private var updatedOrder: [GraphQLRecordID: Int] = [:]
+    private var updateCounter = 0
     private var optimisticLayers: [OptimisticLayer] = []
     private var continuations: [UUID: (id: GraphQLRecordID, continuation: AsyncStream<GraphQLRecord?>.Continuation)] = [:]
 
     public init(records: [GraphQLRecord] = []) {
-        for record in records {
+        for (index, record) in records.enumerated() {
             self.records[record.id] = record
+            self.updatedOrder[record.id] = index + 1
         }
+        self.updateCounter = records.count
     }
 
     public func read(_ id: GraphQLRecordID) -> GraphQLRecord? {
@@ -101,6 +112,7 @@ public actor GraphQLMemoryStore {
 
     public func write(_ record: GraphQLRecord, merge: Bool = true) {
         records[record.id] = mergedRecord(existing: records[record.id], incoming: record, merge: merge)
+        markUpdated(record.id)
         notify(id: record.id)
     }
 
@@ -108,6 +120,7 @@ public actor GraphQLMemoryStore {
         let changedIDs = Set(records.map(\.id))
         for record in records {
             self.records[record.id] = mergedRecord(existing: self.records[record.id], incoming: record, merge: merge)
+            markUpdated(record.id)
         }
         notify(ids: changedIDs)
     }
@@ -116,6 +129,7 @@ public actor GraphQLMemoryStore {
         guard var record = records[id] else { return }
         update(&record)
         records[id] = record
+        markUpdated(id)
         notify(id: id)
     }
 
@@ -144,6 +158,7 @@ public actor GraphQLMemoryStore {
         }
         record.fields[field] = .array(values)
         records[id] = record
+        markUpdated(id)
         notify(id: id)
     }
 
@@ -169,7 +184,40 @@ public actor GraphQLMemoryStore {
 
     public func evict(_ id: GraphQLRecordID) {
         records.removeValue(forKey: id)
+        updatedOrder.removeValue(forKey: id)
         notify(id: id)
+    }
+
+    public func remove(_ id: GraphQLRecordID) {
+        evict(id)
+    }
+
+    public func removeAll(matchingPrefix prefix: String) {
+        let ids = Set(records.keys.filter { $0.rawValue.hasPrefix(prefix) })
+        for id in ids {
+            records.removeValue(forKey: id)
+            updatedOrder.removeValue(forKey: id)
+        }
+        notify(ids: ids)
+    }
+
+    @discardableResult
+    public func trim(maxRecordCount: Int) -> [GraphQLRecordID] {
+        guard maxRecordCount >= 0, records.count > maxRecordCount else { return [] }
+        let evicted = records.keys
+            .sorted { (updatedOrder[$0] ?? 0) < (updatedOrder[$1] ?? 0) }
+            .prefix(records.count - maxRecordCount)
+        let ids = Array(evicted)
+        for id in ids {
+            records.removeValue(forKey: id)
+            updatedOrder.removeValue(forKey: id)
+        }
+        notify(ids: Set(ids))
+        return ids
+    }
+
+    public func recordIDs() -> [GraphQLRecordID] {
+        records.keys.sorted { $0.rawValue < $1.rawValue }
     }
 
     public func evictOptimistic(_ id: GraphQLRecordID, layerID: GraphQLOptimisticLayerID) {
@@ -192,8 +240,10 @@ public actor GraphQLMemoryStore {
             switch change {
             case .record(let record):
                 records[id] = record
+                markUpdated(id)
             case .evicted:
                 records.removeValue(forKey: id)
+                updatedOrder.removeValue(forKey: id)
             }
         }
         notify(ids: Set(layer.changes.keys))
@@ -202,6 +252,7 @@ public actor GraphQLMemoryStore {
     public func clear() {
         let ids = Set(records.keys).union(optimisticLayers.flatMap { $0.changes.keys })
         records.removeAll()
+        updatedOrder.removeAll()
         optimisticLayers.removeAll()
         notify(ids: ids)
     }
@@ -232,6 +283,11 @@ public actor GraphQLMemoryStore {
         for id in ids {
             notify(id: id)
         }
+    }
+
+    private func markUpdated(_ id: GraphQLRecordID) {
+        updateCounter += 1
+        updatedOrder[id] = updateCounter
     }
 
     private func effectiveRecord(_ id: GraphQLRecordID) -> GraphQLRecord? {
@@ -268,5 +324,76 @@ public actor GraphQLMemoryStore {
             return nil
         }
         return GraphQLRecordID(rawValue: rawValue)
+    }
+}
+
+public actor GraphQLOperationCacheStore {
+    private let cache: any GraphQLOperationCache
+    private let decoder: JSONDecoder
+    private let encoder: JSONEncoder
+
+    public init(
+        cache: any GraphQLOperationCache,
+        decoder: JSONDecoder = JSONDecoder(),
+        encoder: JSONEncoder = JSONEncoder()
+    ) {
+        self.cache = cache
+        self.decoder = decoder
+        self.encoder = encoder
+    }
+
+    public func withinReadWriteTransaction<Result: Sendable>(
+        _ body: @Sendable (GraphQLReadWriteTransaction) async throws -> Result
+    ) async throws -> Result {
+        let transaction = GraphQLReadWriteTransaction(cache: cache, decoder: decoder, encoder: encoder)
+        return try await body(transaction)
+    }
+}
+
+public final class GraphQLReadWriteTransaction: @unchecked Sendable {
+    private let cache: any GraphQLOperationCache
+    private let decoder: JSONDecoder
+    private let encoder: JSONEncoder
+
+    init(
+        cache: any GraphQLOperationCache,
+        decoder: JSONDecoder,
+        encoder: JSONEncoder
+    ) {
+        self.cache = cache
+        self.decoder = decoder
+        self.encoder = encoder
+    }
+
+    public func read<Operation: GraphQLOperation>(
+        _ operation: Operation
+    ) async throws -> Operation.Data {
+        let cached = try await cache.read(operation)
+        guard !cached.isPartial, let data = cached.data else {
+            throw GraphQLClientError.partialCacheHit(missingFields: cached.missingFields)
+        }
+        return try GraphQLResponseMaterializer.decode(Operation.Data.self, from: data, decoder: decoder)
+    }
+
+    public func write<Operation: GraphQLOperation, Data: Encodable>(
+        _ operation: Operation,
+        data: Data
+    ) async throws {
+        try await cache.write(operation, data: try jsonValue(from: data))
+    }
+
+    public func update<Operation: GraphQLOperation>(
+        _ operation: Operation,
+        _ update: (inout Operation.Data) throws -> Void
+    ) async throws where Operation.Data: Codable {
+        var data = try await read(operation)
+        try update(&data)
+        try await write(operation, data: data)
+    }
+
+    private func jsonValue<Data: Encodable>(from data: Data) throws -> GraphQLJSONValue {
+        let encoded = try encoder.encode(data)
+        let object = try JSONSerialization.jsonObject(with: encoded)
+        return try GraphQLJSONValue(jsonObject: object)
     }
 }

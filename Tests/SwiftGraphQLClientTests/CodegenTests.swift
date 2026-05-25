@@ -88,6 +88,8 @@ final class CodegenTests: XCTestCase {
         operations:
           - Operations/**/*.graphql
         output: GeneratedGraphQL
+        operationManifest:
+          path: operation-manifest.json
         scalars:
           AWSDateTime: Date
           AWSJSON: GraphQLJSON
@@ -105,6 +107,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(output.contains("deviceId: GraphQLNullable<String> = .none"))
         XCTAssertTrue(output.contains("enum MessagePageDirection"))
         XCTAssertTrue(output.contains("struct LoginMutation: GraphQLMutation"))
+        XCTAssertTrue(output.contains("public static let operationIdentifier = \""))
         XCTAssertTrue(output.contains("struct MessagesQuery: GraphQLQuery"))
         XCTAssertTrue(output.contains("struct ViewerSubscriptionQuery: GraphQLQuery"))
         XCTAssertTrue(output.contains("public static let selections: [SwiftGraphQLClient.GraphQLSelection]"))
@@ -120,6 +123,12 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(output.contains("public struct Message: Codable, Sendable, Equatable"))
         XCTAssertTrue(output.contains("public var messageName: MessageName"))
         XCTAssertTrue(output.contains("public var active: Bool"))
+
+        let manifestURL = root.appendingPathComponent("operation-manifest.json")
+        let manifest = try String(contentsOf: manifestURL)
+        XCTAssertTrue(manifest.contains(#""format" : "apollo-persisted-query-manifest""#))
+        XCTAssertTrue(manifest.contains(#""name" : "Messages""#))
+        XCTAssertTrue(manifest.contains("fragment MessageName on Message"))
     }
 
     func testIntrospectionJSONPrintsSDL() throws {

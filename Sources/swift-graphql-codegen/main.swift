@@ -25,6 +25,22 @@ enum SwiftGraphQLCodegenCLI {
                 fputs("\(error.localizedDescription)\n", stderr)
                 return 1
             }
+        case "generate-operation-manifest":
+            guard let configPath = value(after: "--config", in: arguments) else {
+                fputs("Missing --config path.\n", stderr)
+                return 64
+            }
+            do {
+                let outputURL = try CodegenRunner.generateOperationManifest(
+                    configURL: URL(fileURLWithPath: configPath),
+                    outputOverride: value(after: "--output", in: arguments)
+                )
+                print("Generated \(outputURL.path)")
+                return 0
+            } catch {
+                fputs("\(error.localizedDescription)\n", stderr)
+                return 1
+            }
         case "introspect":
             guard let endpoint = value(after: "--endpoint", in: arguments) else {
                 fputs("Missing --endpoint URL.\n", stderr)
@@ -70,6 +86,7 @@ enum SwiftGraphQLCodegenCLI {
         USAGE:
           swift-graphql introspect --endpoint URL [--header "Name: Value"] --output schema.graphqls
           swift-graphql generate --config swift-graphql-codegen.yml [--output GeneratedGraphQL]
+          swift-graphql generate-operation-manifest --config swift-graphql-codegen.yml [--output operation-manifest.json]
 
         The swift-graphql-codegen executable remains available as a compatibility alias.
         """)

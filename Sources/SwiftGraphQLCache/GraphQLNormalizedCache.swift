@@ -1,22 +1,25 @@
 import Foundation
 import SwiftGraphQLClient
 
-public struct GraphQLNormalizationConfiguration: Sendable, Equatable {
+public struct GraphQLNormalizationConfiguration: Sendable {
     public var rootRecordPrefix: String
     public var objectIDFields: [String]
     public var customKeyFields: [String: [String]]
     public var usesPathFallbackForUnkeyedObjects: Bool
+    public var programmaticCacheKeyResolver: (any GraphQLProgrammaticCacheKeyResolver)?
 
     public init(
         rootRecordPrefix: String = "Operation",
         objectIDFields: [String] = ["id", "_id"],
         customKeyFields: [String: [String]] = [:],
-        usesPathFallbackForUnkeyedObjects: Bool = true
+        usesPathFallbackForUnkeyedObjects: Bool = true,
+        programmaticCacheKeyResolver: (any GraphQLProgrammaticCacheKeyResolver)? = nil
     ) {
         self.rootRecordPrefix = rootRecordPrefix
         self.objectIDFields = objectIDFields
         self.customKeyFields = customKeyFields
         self.usesPathFallbackForUnkeyedObjects = usesPathFallbackForUnkeyedObjects
+        self.programmaticCacheKeyResolver = programmaticCacheKeyResolver
     }
 }
 
@@ -138,6 +141,10 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
     private func recordID(for object: [String: GraphQLJSONValue], path: [String]) -> GraphQLRecordID? {
         let typename = object["__typename"]?.stringValue
         if let typename {
+            if let resolved = configuration.programmaticCacheKeyResolver?.cacheKey(forTypename: typename, object: object) {
+                return resolved
+            }
+
             if let fields = configuration.customKeyFields[typename],
                let key = compositeKey(fields: fields, object: object) {
                 return GraphQLRecordID(rawValue: "\(typename):\(key)")
