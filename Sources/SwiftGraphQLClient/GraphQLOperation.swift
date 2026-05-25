@@ -8,6 +8,7 @@ public protocol GraphQLOperation: Sendable {
     static var operationName: String { get }
     static var document: String { get }
     static var selections: [GraphQLSelection] { get }
+    static var fragments: [String: [GraphQLSelection]] { get }
     var variables: Variables { get }
 }
 
@@ -47,4 +48,5 @@ public indirect enum GraphQLSelection: Sendable, Equatable, Codable {
 
 public extension GraphQLOperation {
     static var selections: [GraphQLSelection] { [] }
+    static var fragments: [String: [GraphQLSelection]] { [:] }
 }

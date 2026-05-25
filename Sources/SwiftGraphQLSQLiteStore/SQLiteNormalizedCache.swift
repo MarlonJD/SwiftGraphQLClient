@@ -1,41 +1,31 @@
 import Foundation
+import SwiftGraphQLCache
 import SwiftGraphQLClient
 
-public struct GraphQLNormalizationConfiguration: Sendable, Equatable {
-    public var rootRecordPrefix: String
-    public var objectIDFields: [String]
-    public var customKeyFields: [String: [String]]
-    public var usesPathFallbackForUnkeyedObjects: Bool
-
-    public init(
-        rootRecordPrefix: String = "Operation",
-        objectIDFields: [String] = ["id", "_id"],
-        customKeyFields: [String: [String]] = [:],
-        usesPathFallbackForUnkeyedObjects: Bool = true
-    ) {
-        self.rootRecordPrefix = rootRecordPrefix
-        self.objectIDFields = objectIDFields
-        self.customKeyFields = customKeyFields
-        self.usesPathFallbackForUnkeyedObjects = usesPathFallbackForUnkeyedObjects
-    }
-}
-
-public actor GraphQLNormalizedCache: GraphQLOperationCache {
-    public let store: GraphQLMemoryStore
+public actor SQLiteNormalizedCache: GraphQLOperationCache {
+    public let store: SQLiteNormalizedStore
     public let configuration: GraphQLNormalizationConfiguration
 
     public init(
-        store: GraphQLMemoryStore = GraphQLMemoryStore(),
+        store: SQLiteNormalizedStore,
         configuration: GraphQLNormalizationConfiguration = GraphQLNormalizationConfiguration()
     ) {
         self.store = store
         self.configuration = configuration
     }
 
+    public init(
+        configuration storeConfiguration: SQLiteNormalizedStoreConfiguration,
+        normalizationConfiguration: GraphQLNormalizationConfiguration = GraphQLNormalizationConfiguration()
+    ) throws {
+        self.store = try SQLiteNormalizedStore(configuration: storeConfiguration)
+        self.configuration = normalizationConfiguration
+    }
+
     public func read<Operation: GraphQLOperation>(_ operation: Operation) async throws -> GraphQLCachedResponse {
         let rootID = try rootRecordID(for: operation)
         let requiredFields = rootRequiredFields(from: Operation.selections, fragments: Operation.fragments)
-        let result = await store.read(rootID, requiredFields: requiredFields)
+        let result = try await store.read(rootID, requiredFields: requiredFields)
         guard let record = result.record else {
             return GraphQLCachedResponse(
                 data: nil,
@@ -46,7 +36,7 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
 
         var missingFields = result.missingFields.map { $0 }.sorted()
         var visited: Set<GraphQLRecordID> = []
-        let data = await denormalizeRecord(record, missingFields: &missingFields, visited: &visited)
+        let data = try await denormalizeRecord(record, missingFields: &missingFields, visited: &visited)
         missingFields.append(contentsOf: selectionMissingFields(
             in: data,
             selections: Operation.selections,
@@ -73,26 +63,7 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
         }
 
         records.append(GraphQLRecord(id: rootID, fields: rootFields))
-        await store.write(records)
-    }
-
-    public func watch<Operation: GraphQLOperation>(
-        _ operation: Operation
-    ) async throws -> AsyncStream<GraphQLCachedResponse> {
-        let rootID = try rootRecordID(for: operation)
-        let rawStream = await store.watch(rootID)
-        return AsyncStream { continuation in
-            Task {
-                for await _ in rawStream {
-                    do {
-                        continuation.yield(try await read(operation))
-                    } catch {
-                        continuation.yield(GraphQLCachedResponse(data: nil, isPartial: true))
-                    }
-                }
-                continuation.finish()
-            }
-        }
+        try await store.write(records)
     }
 
     private func rootRecordID<Operation: GraphQLOperation>(for operation: Operation) throws -> GraphQLRecordID {
@@ -170,7 +141,7 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
         _ record: GraphQLRecord,
         missingFields: inout [String],
         visited: inout Set<GraphQLRecordID>
-    ) async -> GraphQLJSONValue {
+    ) async throws -> GraphQLJSONValue {
         if visited.contains(record.id) {
             return GraphQLRecord.referenceValue(record.id)
         }
@@ -178,7 +149,7 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
         var fields: [String: GraphQLJSONValue] = [:]
         fields.reserveCapacity(record.fields.count)
         for (field, value) in record.fields {
-            fields[field] = await denormalize(value, path: field, missingFields: &missingFields, visited: &visited)
+            fields[field] = try await denormalize(value, path: field, missingFields: &missingFields, visited: &visited)
         }
         visited.remove(record.id)
         return .object(fields)
@@ -189,13 +160,13 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
         path: String,
         missingFields: inout [String],
         visited: inout Set<GraphQLRecordID>
-    ) async -> GraphQLJSONValue {
+    ) async throws -> GraphQLJSONValue {
         switch value {
         case .array(let values):
             var denormalized: [GraphQLJSONValue] = []
             denormalized.reserveCapacity(values.count)
             for (index, value) in values.enumerated() {
-                denormalized.append(await denormalize(
+                denormalized.append(try await denormalize(
                     value,
                     path: "\(path).\(index)",
                     missingFields: &missingFields,
@@ -205,17 +176,17 @@ public actor GraphQLNormalizedCache: GraphQLOperationCache {
             return .array(denormalized)
         case .object(let object):
             if let reference = Self.referenceID(value) {
-                guard let record = await store.read(reference) else {
+                guard let record = try await store.read(reference) else {
                     missingFields.append(path)
                     return .null
                 }
-                return await denormalizeRecord(record, missingFields: &missingFields, visited: &visited)
+                return try await denormalizeRecord(record, missingFields: &missingFields, visited: &visited)
             }
 
             var fields: [String: GraphQLJSONValue] = [:]
             fields.reserveCapacity(object.count)
             for (field, value) in object {
-                fields[field] = await denormalize(
+                fields[field] = try await denormalize(
                     value,
                     path: "\(path).\(field)",
                     missingFields: &missingFields,

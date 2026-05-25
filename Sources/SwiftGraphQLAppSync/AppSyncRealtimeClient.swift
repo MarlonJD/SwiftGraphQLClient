@@ -114,6 +114,44 @@ public final class AppSyncRealtimeClient: GraphQLSubscriptionTransport, @uncheck
     }
 }
 
+public final class AppSyncMultiplexedRealtimeClient: GraphQLSubscriptionTransport, @unchecked Sendable {
+    private let connection: AppSyncMultiplexConnection
+
+    public init(
+        configuration: AppSyncRealtimeConfiguration,
+        connector: any AppSyncWebSocketConnecting = URLSession.shared,
+        encoder: JSONEncoder = JSONEncoder(),
+        decoder: JSONDecoder = JSONDecoder()
+    ) {
+        let codec = AppSyncRealtimeCodec(configuration: configuration, encoder: encoder, decoder: decoder)
+        self.connection = AppSyncMultiplexConnection(codec: codec, connector: connector)
+    }
+
+    public func subscribe<Subscription: GraphQLSubscription>(
+        _ subscription: Subscription,
+        id: String = UUID().uuidString,
+        onReady: (@Sendable () -> Void)? = nil
+    ) -> AsyncThrowingStream<Subscription.Data, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                await connection.add(subscription, id: id, onReady: onReady, continuation: continuation)
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+                Task {
+                    await self.connection.remove(id: id)
+                }
+            }
+        }
+    }
+
+    public func subscribe<Subscription: GraphQLSubscription>(
+        _ subscription: Subscription
+    ) -> AsyncThrowingStream<Subscription.Data, Error> {
+        subscribe(subscription, id: UUID().uuidString, onReady: nil)
+    }
+}
+
 public struct AppSyncRealtimeCodec: Sendable {
     public var configuration: AppSyncRealtimeConfiguration
 
@@ -453,5 +491,252 @@ private final class AppSyncSubscriptionRunner<Subscription: GraphQLSubscription>
         lock.lock()
         defer { lock.unlock() }
         return socket
+    }
+}
+
+private actor AppSyncMultiplexConnection {
+    private struct Operation {
+        var started: Bool
+        let makeStartMessage: @Sendable ([String: String]) throws -> String
+        let handleMessage: @Sendable (URLSessionWebSocketTask.Message) throws -> Bool
+        let finish: @Sendable (Error?) -> Void
+        let onReady: (@Sendable () -> Void)?
+    }
+
+    private let codec: AppSyncRealtimeCodec
+    private let connector: any AppSyncWebSocketConnecting
+    private var operations: [String: Operation] = [:]
+    private var socket: (any AppSyncWebSocketTask)?
+    private var task: Task<Void, Never>?
+    private var isAcknowledged = false
+    private var reconnectAttempt = 0
+    private var currentHeaders: [String: String] = [:]
+
+    init(codec: AppSyncRealtimeCodec, connector: any AppSyncWebSocketConnecting) {
+        self.codec = codec
+        self.connector = connector
+    }
+
+    func add<Subscription: GraphQLSubscription>(
+        _ subscription: Subscription,
+        id: String,
+        onReady: (@Sendable () -> Void)?,
+        continuation: AsyncThrowingStream<Subscription.Data, Error>.Continuation
+    ) {
+        let codec = self.codec
+        operations[id] = Operation(
+            started: false,
+            makeStartMessage: { headers in
+                try codec.startMessage(id: id, subscription: subscription, headers: headers)
+            },
+            handleMessage: { message in
+                let event: AppSyncRealtimeEvent<Subscription.Data>
+                switch message {
+                case .string(let text):
+                    event = try codec.decodeEvent(text: text, expectedID: id, as: Subscription.Data.self)
+                case .data(let data):
+                    event = try codec.decodeEvent(data: data, expectedID: id, as: Subscription.Data.self)
+                @unknown default:
+                    return false
+                }
+
+                switch event {
+                case .data(let data):
+                    continuation.yield(data)
+                    return false
+                case .error(let payload):
+                    continuation.finish(throwing: AppSyncRealtimeError.serverError(payload))
+                    return true
+                case .complete:
+                    continuation.finish()
+                    return true
+                case .connectionAck, .startAck, .keepAlive, .ignored:
+                    return false
+                }
+            },
+            finish: { error in
+                if let error {
+                    continuation.finish(throwing: error)
+                } else {
+                    continuation.finish()
+                }
+            },
+            onReady: onReady
+        )
+
+        if isAcknowledged {
+            Task {
+                try? await self.startOperation(id: id)
+            }
+        }
+        ensureRunning()
+    }
+
+    func remove(id: String) async {
+        let existing = operations.removeValue(forKey: id)
+        if existing?.started == true, let socket, let stopMessage = try? codec.stopMessage(id: id) {
+            try? await socket.send(.string(stopMessage))
+        }
+        if operations.isEmpty {
+            task?.cancel()
+            task = nil
+            socket?.cancel(with: .goingAway, reason: nil)
+            socket = nil
+            isAcknowledged = false
+        }
+    }
+
+    private func ensureRunning() {
+        guard task == nil else { return }
+        task = Task {
+            await run()
+        }
+    }
+
+    private func run() async {
+        while !Task.isCancelled, !operations.isEmpty {
+            do {
+                try await connectAndReceive()
+                finishAll(error: nil)
+                return
+            } catch {
+                socket?.cancel(with: .goingAway, reason: nil)
+                socket = nil
+                isAcknowledged = false
+                markAllUnstarted()
+
+                if Task.isCancelled || operations.isEmpty {
+                    finishAll(error: nil)
+                    return
+                }
+
+                guard shouldReconnect(after: error) else {
+                    finishAll(error: error)
+                    return
+                }
+
+                reconnectAttempt += 1
+                await sleepBeforeReconnect()
+            }
+        }
+        finishAll(error: nil)
+    }
+
+    private func connectAndReceive() async throws {
+        let headers = try await codec.authHeaders()
+        currentHeaders = headers
+        let request = try codec.makeWebSocketRequest(headers: headers)
+        let socket = connector.appSyncWebSocketTask(with: request)
+        self.socket = socket
+        socket.resume()
+        try await socket.send(.string(try codec.connectionInitMessage()))
+
+        while !Task.isCancelled, !operations.isEmpty {
+            let message = try await receive(from: socket)
+            try await handle(message, socket: socket)
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message, socket: any AppSyncWebSocketTask) async throws {
+        let envelope = try envelope(from: message)
+        switch envelope.type {
+        case "connection_ack":
+            isAcknowledged = true
+            reconnectAttempt = 0
+            for id in operations.keys.sorted() {
+                try await startOperation(id: id)
+            }
+        case "start_ack":
+            if let id = envelope.id {
+                operations[id]?.onReady?()
+            }
+        case "ka":
+            return
+        case "data", "error", "complete":
+            guard let id = envelope.id, let operation = operations[id] else {
+                if envelope.type == "error" {
+                    throw AppSyncRealtimeError.serverError(envelope.payload?.error)
+                }
+                return
+            }
+            let isFinished = try operation.handleMessage(message)
+            if isFinished {
+                operations.removeValue(forKey: id)
+            }
+        default:
+            return
+        }
+    }
+
+    private func startOperation(id: String) async throws {
+        guard var operation = operations[id], !operation.started, let socket else { return }
+        try await socket.send(.string(try operation.makeStartMessage(currentHeaders)))
+        operation.started = true
+        operations[id] = operation
+    }
+
+    private func markAllUnstarted() {
+        for id in operations.keys {
+            operations[id]?.started = false
+        }
+    }
+
+    private func shouldReconnect(after error: Error) -> Bool {
+        guard reconnectAttempt < codec.configuration.maxReconnectAttempts else { return false }
+        if error is CancellationError { return false }
+        if let realtimeError = error as? AppSyncRealtimeError,
+           case .serverError = realtimeError {
+            return false
+        }
+        return true
+    }
+
+    private func sleepBeforeReconnect() async {
+        let seconds = max(0, codec.configuration.reconnectBackoff)
+        guard seconds > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    private func receive(from socket: any AppSyncWebSocketTask) async throws -> URLSessionWebSocketTask.Message {
+        guard let timeout = codec.configuration.keepAliveTimeout, timeout > 0 else {
+            return try await socket.receive()
+        }
+        return try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            group.addTask {
+                try await socket.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw AppSyncRealtimeError.keepAliveTimeout
+            }
+            guard let message = try await group.next() else {
+                throw AppSyncRealtimeError.unsupportedMessage
+            }
+            group.cancelAll()
+            return message
+        }
+    }
+
+    private func envelope(from message: URLSessionWebSocketTask.Message) throws -> AppSyncInboundMessage<GraphQLJSONValue> {
+        switch message {
+        case .string(let text):
+            return try JSONDecoder().decode(AppSyncInboundMessage<GraphQLJSONValue>.self, from: Data(text.utf8))
+        case .data(let data):
+            return try JSONDecoder().decode(AppSyncInboundMessage<GraphQLJSONValue>.self, from: data)
+        @unknown default:
+            throw AppSyncRealtimeError.unsupportedMessage
+        }
+    }
+
+    private func finishAll(error: Error?) {
+        let current = operations
+        operations.removeAll()
+        task = nil
+        socket = nil
+        isAcknowledged = false
+        currentHeaders = [:]
+        for operation in current.values {
+            operation.finish(error)
+        }
     }
 }

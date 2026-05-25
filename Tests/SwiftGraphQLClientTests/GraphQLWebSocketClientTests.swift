@@ -89,6 +89,49 @@ final class GraphQLWebSocketClientTests: XCTestCase {
         XCTAssertEqual(try secondSent.map(messageType), ["connection_init", "subscribe"])
     }
 
+    func testMultiplexedClientSharesSocketForMultipleSubscriptions() async throws {
+        let socket = GatedMockGraphQLWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#),
+            .string(#"{"type":"next","id":"sub-1","payload":{"data":{"messageCreated":{"id":"message-1","requestId":"request-1"}}}}"#),
+            .string(#"{"type":"next","id":"sub-2","payload":{"data":{"messageCreated":{"id":"message-2","requestId":"request-2"}}}}"#),
+            .string(#"{"type":"complete","id":"sub-1"}"#),
+            .string(#"{"type":"complete","id":"sub-2"}"#)
+        ])
+        let connector = MockGraphQLWebSocketConnector(socket: socket)
+        let client = GraphQLMultiplexedWebSocketClient(
+            configuration: GraphQLWebSocketConfiguration(
+                endpointURL: URL(string: "wss://api.example.com/graphql")!
+            ),
+            connector: connector
+        )
+
+        var firstIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-1"),
+            id: "sub-1"
+        ).makeAsyncIterator()
+        var secondIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-2"),
+            id: "sub-2"
+        ).makeAsyncIterator()
+
+        await socket.releaseReceives()
+        let first = try await firstIterator.next()
+        let second = try await secondIterator.next()
+        let firstCompleted = try await firstIterator.next()
+        let secondCompleted = try await secondIterator.next()
+
+        XCTAssertEqual(first?.messageCreated.id, "message-1")
+        XCTAssertEqual(second?.messageCreated.id, "message-2")
+        XCTAssertNil(firstCompleted)
+        XCTAssertNil(secondCompleted)
+        XCTAssertEqual(connector.requests.count, 1)
+
+        let sent = await socket.sentStrings
+        let messageTypes = try sent.map(messageType)
+        XCTAssertEqual(messageTypes.filter { $0 == "connection_init" }.count, 1)
+        XCTAssertEqual(messageTypes.filter { $0 == "subscribe" }.count, 2)
+    }
+
     func testCodecBuildsProtocolMessages() throws {
         let codec = makeCodec(connectionInitPayload: .object(["source": .string("test")]))
 
@@ -199,7 +242,7 @@ private struct MessageCreatedSubscription: GraphQLSubscription {
 }
 
 private final class MockGraphQLWebSocketConnector: GraphQLWebSocketConnecting, @unchecked Sendable {
-    private let socket: MockGraphQLWebSocketTask
+    private let socket: any GraphQLWebSocketTask
     private let lock = NSLock()
     private var storedRequests: [URLRequest] = []
 
@@ -209,7 +252,7 @@ private final class MockGraphQLWebSocketConnector: GraphQLWebSocketConnecting, @
         return storedRequests
     }
 
-    init(socket: MockGraphQLWebSocketTask) {
+    init(socket: any GraphQLWebSocketTask) {
         self.socket = socket
     }
 
@@ -309,6 +352,87 @@ private actor MockGraphQLWebSocketTaskState {
     }
 
     func receive() throws -> URLSessionWebSocketTask.Message {
+        guard !messages.isEmpty else {
+            throw GraphQLWebSocketError.unsupportedMessage
+        }
+        return messages.removeFirst()
+    }
+}
+
+private final class GatedMockGraphQLWebSocketTask: GraphQLWebSocketTask, @unchecked Sendable {
+    private let state: GatedMockGraphQLWebSocketTaskState
+
+    var sentStrings: [String] {
+        get async {
+            await state.sentStrings
+        }
+    }
+
+    init(messages: [URLSessionWebSocketTask.Message]) {
+        self.state = GatedMockGraphQLWebSocketTaskState(messages: messages)
+    }
+
+    func releaseReceives() async {
+        await state.release()
+    }
+
+    func resume() {
+        Task {
+            await state.resume()
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        await state.send(message)
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        try await state.receive()
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+}
+
+private actor GatedMockGraphQLWebSocketTaskState {
+    private var messages: [URLSessionWebSocketTask.Message]
+    private var storedSentStrings: [String] = []
+    private var resumed = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var sentStrings: [String] {
+        storedSentStrings
+    }
+
+    init(messages: [URLSessionWebSocketTask.Message]) {
+        self.messages = messages
+    }
+
+    func resume() {
+        resumed = true
+    }
+
+    func release() {
+        released = true
+        let currentWaiters = waiters
+        waiters.removeAll()
+        for waiter in currentWaiters {
+            waiter.resume()
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) {
+        if case .string(let text) = message {
+            storedSentStrings.append(text)
+        }
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        if !released {
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
         guard !messages.isEmpty else {
             throw GraphQLWebSocketError.unsupportedMessage
         }

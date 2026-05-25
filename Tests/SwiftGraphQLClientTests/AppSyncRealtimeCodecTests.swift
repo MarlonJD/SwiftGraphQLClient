@@ -45,6 +45,51 @@ final class AppSyncRealtimeCodecTests: XCTestCase {
         XCTAssertTrue(didResume)
     }
 
+    func testMultiplexedClientSharesSocketForMultipleSubscriptions() async throws {
+        let socket = GatedMockAppSyncWebSocketTask(messages: [
+            .string(#"{"type":"connection_ack"}"#),
+            .string(#"{"type":"start_ack","id":"sub-1"}"#),
+            .string(#"{"type":"start_ack","id":"sub-2"}"#),
+            .string(#"{"type":"data","id":"sub-1","payload":{"data":{"messageCreated":{"id":"message-1","requestId":"request-1"}}}}"#),
+            .string(#"{"type":"data","id":"sub-2","payload":{"data":{"messageCreated":{"id":"message-2","requestId":"request-2"}}}}"#),
+            .string(#"{"type":"complete","id":"sub-1"}"#),
+            .string(#"{"type":"complete","id":"sub-2"}"#)
+        ])
+        let connector = MockAppSyncConnector(socket: socket)
+        let client = AppSyncMultiplexedRealtimeClient(
+            configuration: AppSyncRealtimeConfiguration(
+                realtimeEndpointURL: URL(string: "wss://realtime.example.com/graphql")!,
+                graphQLEndpointURL: URL(string: "https://api.example.com/graphql")!
+            ),
+            connector: connector
+        )
+
+        var firstIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-1"),
+            id: "sub-1"
+        ).makeAsyncIterator()
+        var secondIterator = client.subscribe(
+            MessageCreatedSubscription(requestId: "request-2"),
+            id: "sub-2"
+        ).makeAsyncIterator()
+
+        await socket.releaseReceives()
+        let first = try await firstIterator.next()
+        let second = try await secondIterator.next()
+        let firstCompleted = try await firstIterator.next()
+        let secondCompleted = try await secondIterator.next()
+
+        XCTAssertEqual(first?.messageCreated.id, "message-1")
+        XCTAssertEqual(second?.messageCreated.id, "message-2")
+        XCTAssertNil(firstCompleted)
+        XCTAssertNil(secondCompleted)
+        XCTAssertEqual(connector.requests.count, 1)
+
+        let sent = await socket.sentStrings
+        XCTAssertEqual(sent.filter { $0.contains(#""type":"connection_init""#) }.count, 1)
+        XCTAssertEqual(sent.filter { $0.contains(#""type":"start""#) }.count, 2)
+    }
+
     func testWebSocketRequestCarriesBase64AuthorizationHeader() throws {
         let codec = makeCodec()
         let request = try codec.makeWebSocketRequest(headers: ["Authorization": "Bearer token"])
@@ -160,7 +205,7 @@ private struct MessageCreatedSubscription: GraphQLSubscription {
 }
 
 private final class MockAppSyncConnector: AppSyncWebSocketConnecting, @unchecked Sendable {
-    private let socket: MockAppSyncWebSocketTask
+    private let socket: any AppSyncWebSocketTask
     private let lock = NSLock()
     private var storedRequests: [URLRequest] = []
 
@@ -170,7 +215,7 @@ private final class MockAppSyncConnector: AppSyncWebSocketConnecting, @unchecked
         return storedRequests
     }
 
-    init(socket: MockAppSyncWebSocketTask) {
+    init(socket: any AppSyncWebSocketTask) {
         self.socket = socket
     }
 
@@ -246,6 +291,87 @@ private actor MockAppSyncWebSocketTaskState {
     }
 
     func receive() throws -> URLSessionWebSocketTask.Message {
+        guard !messages.isEmpty else {
+            throw AppSyncRealtimeError.unsupportedMessage
+        }
+        return messages.removeFirst()
+    }
+}
+
+private final class GatedMockAppSyncWebSocketTask: AppSyncWebSocketTask, @unchecked Sendable {
+    private let state: GatedMockAppSyncWebSocketTaskState
+
+    var sentStrings: [String] {
+        get async {
+            await state.sentStrings
+        }
+    }
+
+    init(messages: [URLSessionWebSocketTask.Message]) {
+        self.state = GatedMockAppSyncWebSocketTaskState(messages: messages)
+    }
+
+    func releaseReceives() async {
+        await state.release()
+    }
+
+    func resume() {
+        Task {
+            await state.resume()
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        await state.send(message)
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        try await state.receive()
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+}
+
+private actor GatedMockAppSyncWebSocketTaskState {
+    private var messages: [URLSessionWebSocketTask.Message]
+    private var storedSentStrings: [String] = []
+    private var resumed = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var sentStrings: [String] {
+        storedSentStrings
+    }
+
+    init(messages: [URLSessionWebSocketTask.Message]) {
+        self.messages = messages
+    }
+
+    func resume() {
+        resumed = true
+    }
+
+    func release() {
+        released = true
+        let currentWaiters = waiters
+        waiters.removeAll()
+        for waiter in currentWaiters {
+            waiter.resume()
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) {
+        if case .string(let text) = message {
+            storedSentStrings.append(text)
+        }
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        if !released {
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
         guard !messages.isEmpty else {
             throw AppSyncRealtimeError.unsupportedMessage
         }

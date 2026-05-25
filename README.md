@@ -6,14 +6,31 @@ Current status: first runtime and Kindred-focused codegen milestones are in plac
 
 The codegen CLI now has an MVP `generate` command. It can read the current YAML config or a legacy JSON config, parse schema scalars/enums/input objects/object fields plus operation and fragment selections, and emit operation structs, input objects, fragments, scalar aliases, and nested `Codable` response `Data` models under the configured namespace.
 
+## Why Use This Package
+
+- You want a Swift-native GraphQL client that keeps operation definitions,
+  generated types, runtime execution, and cache integration in one SwiftPM
+  package.
+- You need typed queries, mutations, subscriptions, fragments, input objects,
+  custom scalar mappings, and generated `Codable` response models without
+  maintaining a separate JavaScript codegen toolchain.
+- You want modular adoption: use only the HTTP runtime, then add normalized
+  caching, SQLite persistence, uploads, WebSocket subscriptions, AppSync
+  realtime transport, or the SwiftPM codegen plugin as your app needs them.
+- You need production-oriented runtime behavior such as auth headers,
+  coordinated refresh-on-401 retry, multipart uploads, GraphQL error parsing,
+  cache policies, optimistic cache layers, and reconnecting subscriptions.
+- You prefer Swift concurrency APIs and package-local generated sources that
+  fit iOS and macOS builds without extra application-level scaffolding.
+
 ## Products
 
 - `SwiftGraphQLClient`: typed operation protocols, HTTP runtime, auth providers, errors, scalars.
 - `SwiftGraphQLCache`: in-memory normalized record store with watchers, partial-read detection, optimistic layers, and cursor-list reference helpers.
 - `SwiftGraphQLSQLiteStore`: SQLite normalized record persistence.
 - `SwiftGraphQLUpload`: `GraphQLUpload`, multipart request body builder, and upload-aware request encoder.
-- `SwiftGraphQLWebSocket`: `graphql-transport-ws` subscription transport.
-- `SwiftGraphQLAppSync`: AppSync realtime request/message codec.
+- `SwiftGraphQLWebSocket`: single-operation and multiplexed `graphql-transport-ws` subscription transports.
+- `SwiftGraphQLAppSync`: single-operation and multiplexed AppSync realtime transports.
 - `swift-graphql`: CLI for introspection SDL export and Swift generation.
 - `swift-graphql-codegen`: compatibility CLI alias for existing generation scripts.
 - `SwiftGraphQLCodegenPlugin`: SwiftPM build tool plugin that runs generation from `swift-graphql-codegen.yml`.
@@ -49,11 +66,12 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 - GraphQL variable builder with omitted-vs-null support.
 - Multipart upload body builder plus `GraphQLUploadRequestEncoder` for auto-switching configured clients to multipart when upload variables are present.
 - Fragment projection helper for generated `.fragments.foo` accessors.
-- Standard `graphql-transport-ws` transport for connection init, subscribe, ping/pong, next/error/complete message decoding, reconnect, keepalive timeout, fresh auth headers per reconnect, and generated subscription streams.
-- AppSync realtime transport for `graphql-ws` connection init, start, stop, ack/keepalive/data/error/complete message decoding, reconnect, keepalive timeout, fresh auth headers per reconnect, and generated subscription streams.
+- Standard `graphql-transport-ws` transports for connection init, subscribe, ping/pong, next/error/complete message decoding, reconnect, keepalive timeout, fresh auth headers per reconnect, generated subscription streams, and optional single-socket multiplexing via `GraphQLMultiplexedWebSocketClient`.
+- AppSync realtime transports for `graphql-ws` connection init, start, stop, ack/keepalive/data/error/complete message decoding, reconnect, keepalive timeout, fresh auth headers per reconnect, generated subscription streams, and optional single-socket multiplexing via `AppSyncMultiplexedRealtimeClient`.
 - Introspection JSON to SDL conversion plus `swift-graphql-codegen introspect --endpoint ... --output ...`.
 - Codegen emits `Upload = GraphQLUpload` and imports `SwiftGraphQLUpload` when the schema declares `scalar Upload`.
 - Codegen supports scalar mappings via `scalars`, `scalarMappings`, or `customScalars` in `swift-graphql-codegen.yml`.
+- Codegen emits fragment selection metadata for cache partial-read detection through fragment spreads.
 - SwiftPM build tool plugin discovers `swift-graphql-codegen.yml`/`.yaml` in the target or package root and emits generated sources into the plugin work directory.
 
 ## Implemented Cache Pieces
@@ -66,6 +84,7 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 - Cursor/list reference append with deduplication.
 - SQLite-backed record persistence with merge writes, partial-read detection, eviction, clear, batch transactions, and WAL mode.
 - `GraphQLNormalizedCache` bridges normalized records into `GraphQLClient` cache policies, stores entities by `__typename:id` by default, supports custom key fields, and falls back to stable response paths for unkeyed objects.
+- `SQLiteNormalizedCache` provides the same `GraphQLOperationCache` bridge on top of SQLite persistence.
 
 ## Kindred Migration Notes
 

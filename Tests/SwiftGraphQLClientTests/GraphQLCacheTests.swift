@@ -149,13 +149,18 @@ private struct CacheViewerQuery: GraphQLQuery {
     static let document = "query CacheViewer($slug: String!) { viewer(slug: $slug) { __typename slug name settings { theme } } }"
     static let selections: [GraphQLSelection] = [
         .field(name: "viewer", responseName: "viewer", selections: [
-            .field(name: "__typename", responseName: "__typename", selections: []),
-            .field(name: "slug", responseName: "slug", selections: []),
-            .field(name: "name", responseName: "name", selections: []),
+            .fragmentSpread("ViewerFields"),
             .field(name: "settings", responseName: "settings", selections: [
                 .field(name: "theme", responseName: "theme", selections: [])
             ])
         ])
+    ]
+    static let fragments: [String: [GraphQLSelection]] = [
+        "ViewerFields": [
+            .field(name: "__typename", responseName: "__typename", selections: []),
+            .field(name: "slug", responseName: "slug", selections: []),
+            .field(name: "name", responseName: "name", selections: [])
+        ]
     ]
 
     struct Variables: Encodable, Sendable {

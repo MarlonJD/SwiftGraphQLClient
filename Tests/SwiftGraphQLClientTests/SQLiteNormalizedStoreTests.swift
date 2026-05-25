@@ -45,9 +45,71 @@ final class SQLiteNormalizedStoreTests: XCTestCase {
         XCTAssertNil(cleared)
     }
 
+    func testSQLiteNormalizedCachePersistsOperationResponses() async throws {
+        let fileURL = temporaryDatabaseURL()
+        let cache = try SQLiteNormalizedCache(configuration: SQLiteNormalizedStoreConfiguration(fileURL: fileURL))
+        let query = SQLiteViewerQuery(id: "1")
+
+        try await cache.write(query, data: .object([
+            "viewer": .object([
+                "__typename": .string("User"),
+                "id": .string("1"),
+                "name": .string("Marlon")
+            ])
+        ]))
+
+        let reopened = try SQLiteNormalizedCache(configuration: SQLiteNormalizedStoreConfiguration(fileURL: fileURL))
+        let response = try await reopened.read(query)
+
+        XCTAssertFalse(response.isPartial)
+        XCTAssertEqual(response.data, .object([
+            "viewer": .object([
+                "__typename": .string("User"),
+                "id": .string("1"),
+                "name": .string("Marlon")
+            ])
+        ]))
+    }
+
     private func temporaryDatabaseURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("SwiftGraphQLSQLiteStoreTests-\(UUID().uuidString)")
             .appendingPathExtension("sqlite")
+    }
+}
+
+private struct SQLiteViewerQuery: GraphQLQuery {
+    static let operationName = "SQLiteViewer"
+    static let document = "query SQLiteViewer($id: ID!) { viewer(id: $id) { __typename id name } }"
+    static let selections: [GraphQLSelection] = [
+        .field(name: "viewer", responseName: "viewer", selections: [
+            .fragmentSpread("SQLiteViewerFields")
+        ])
+    ]
+    static let fragments: [String: [GraphQLSelection]] = [
+        "SQLiteViewerFields": [
+            .field(name: "__typename", responseName: "__typename", selections: []),
+            .field(name: "id", responseName: "id", selections: []),
+            .field(name: "name", responseName: "name", selections: [])
+        ]
+    ]
+
+    struct Variables: Encodable, Sendable {
+        let id: GraphQLID
+    }
+
+    struct Data: Codable, Sendable, Equatable {
+        struct Viewer: Codable, Sendable, Equatable {
+            let id: GraphQLID
+            let name: String
+        }
+
+        let viewer: Viewer
+    }
+
+    let id: GraphQLID
+
+    var variables: Variables {
+        Variables(id: id)
     }
 }

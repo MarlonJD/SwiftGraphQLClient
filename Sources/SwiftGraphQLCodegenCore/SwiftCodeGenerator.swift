@@ -149,6 +149,10 @@ struct SwiftCodeGenerator: Sendable {
             output += "    public static let operationName = \"\(operation.name)\"\n"
             output += "    public static let document = #\"\"\"\n\(documentSource(for: operation, fragments: fragments))\n\"\"\"#\n\n"
             output += "    public static let selections: [SwiftGraphQLClient.GraphQLSelection] = \(renderSelectionMetadata(selectionSet.selections, indent: 4))\n\n"
+            let fragmentMetadata = try renderFragmentMetadataMap(names: operation.fragmentSpreads, fragments: fragments, indent: 4)
+            if fragmentMetadata != "[:]" {
+                output += "    public static let fragments: [String: [SwiftGraphQLClient.GraphQLSelection]] = \(fragmentMetadata)\n\n"
+            }
             for variable in operation.variables {
                 output += "    public var \(escapedIdentifier(variable.name)): \(swiftInputType(variable.type, schema: schema, scalarMappings: scalarMappings))\n"
             }
@@ -589,6 +593,47 @@ struct SwiftCodeGenerator: Sendable {
             let renderedTypeName = typeName.map(swiftStringLiteral) ?? "nil"
             return ".inlineFragment(typeName: \(renderedTypeName), selections: \(renderSelectionMetadata(selections, indent: indent)))"
         }
+    }
+
+    private func renderFragmentMetadataMap(
+        names: Set<String>,
+        fragments: [String: GraphQLFragmentDefinition],
+        indent: Int
+    ) throws -> String {
+        let allNames = recursiveFragmentNames(names, fragments: fragments)
+        guard !allNames.isEmpty else { return "[:]" }
+        let baseIndent = String(repeating: " ", count: indent)
+        let itemIndent = String(repeating: " ", count: indent + 2)
+        var output = "[\n"
+        for (index, name) in allNames.sorted().enumerated() {
+            guard let fragment = fragments[name] else { continue }
+            let selections = try GraphQLSelectionParser.parseSelectionSet(in: fragment.source).selections
+            output += "\(itemIndent)\(swiftStringLiteral(name)): \(renderSelectionMetadata(selections, indent: indent + 2))"
+            if index != allNames.count - 1 {
+                output += ","
+            }
+            output += "\n"
+        }
+        output += "\(baseIndent)]"
+        return output
+    }
+
+    private func recursiveFragmentNames(
+        _ names: Set<String>,
+        fragments: [String: GraphQLFragmentDefinition]
+    ) -> Set<String> {
+        var result = Set<String>()
+        func visit(_ name: String) {
+            guard !result.contains(name), let fragment = fragments[name] else { return }
+            result.insert(name)
+            for nested in fragment.fragmentSpreads {
+                visit(nested)
+            }
+        }
+        for name in names {
+            visit(name)
+        }
+        return result
     }
 
     private func swiftStringLiteral(_ value: String) -> String {
