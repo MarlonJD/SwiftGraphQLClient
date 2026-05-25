@@ -139,7 +139,7 @@ struct SwiftCodeGenerator: Sendable {
             let selectionSet = try GraphQLSelectionParser.parseSelectionSet(in: operation.source)
             let dataModel = try buildSelectionSet(
                 name: "Data",
-                parentGraphQLType: rootTypeName(for: operation.kind),
+                parentGraphQLType: rootTypeName(for: operation.kind, schema: schema),
                 selections: selectionSet.selections,
                 fragments: fragments,
                 schema: schema,
@@ -196,6 +196,8 @@ struct SwiftCodeGenerator: Sendable {
                 output += "    public init() {}\n\n"
             }
             output += renderSelectionSet(dataModel, indent: 4)
+            output += "\n"
+            output += renderLocalCacheMutation(operationStructName: structName, indent: 4)
             output += "  }\n\n"
         }
         output += "}\n"
@@ -210,8 +212,11 @@ struct SwiftCodeGenerator: Sendable {
         for field in model.fields {
             output += "\(innerIndent)public var \(field.propertyName): \(field.swiftType)\n"
         }
+        for inlineFragment in model.inlineFragments {
+            output += "\(innerIndent)public var \(inlineFragment.propertyName): \(inlineFragment.model.name)?\n"
+        }
 
-        if !model.fields.isEmpty {
+        if !model.fields.isEmpty || !model.inlineFragments.isEmpty {
             output += "\n"
         }
         if !model.fragmentSpreads.isEmpty {
@@ -219,9 +224,13 @@ struct SwiftCodeGenerator: Sendable {
         }
 
         output += renderInitializer(for: model, indent: indent + 2)
-        if needsCodingKeys(model.fields) {
+        if needsCodingKeys(model.fields) || !model.inlineFragments.isEmpty {
             output += "\n"
             output += renderCodingKeys(for: model.fields, indent: indent + 2)
+        }
+        if !model.inlineFragments.isEmpty {
+            output += "\n"
+            output += renderConditionalCodable(for: model, indent: indent + 2)
         }
         if !model.fragmentSpreads.isEmpty {
             output += "\n"
@@ -231,6 +240,10 @@ struct SwiftCodeGenerator: Sendable {
             output += "\n"
             output += renderSelectionSet(nested, indent: indent + 2)
         }
+        for inlineFragment in model.inlineFragments {
+            output += "\n"
+            output += renderSelectionSet(inlineFragment.model, indent: indent + 2)
+        }
         output += "\(baseIndent)}\n"
         return output
     }
@@ -238,19 +251,32 @@ struct SwiftCodeGenerator: Sendable {
     private func renderInitializer(for model: GeneratedSelectionSet, indent: Int) -> String {
         let baseIndent = String(repeating: " ", count: indent)
         let bodyIndent = String(repeating: " ", count: indent + 2)
-        guard !model.fields.isEmpty else {
+        guard !model.fields.isEmpty || !model.inlineFragments.isEmpty else {
             return "\(baseIndent)public init() {}\n"
         }
 
+        let parameters = model.fields.map { field in
+            (
+                name: field.propertyName,
+                type: field.swiftType,
+                defaultValue: field.swiftType.hasSuffix("?") ? " = nil" : ""
+            )
+        } + model.inlineFragments.map { inlineFragment in
+            (
+                name: inlineFragment.propertyName,
+                type: "\(inlineFragment.model.name)?",
+                defaultValue: " = nil"
+            )
+        }
+
         var output = "\(baseIndent)public init(\n"
-        output += model.fields.enumerated().map { index, field in
-            let defaultValue = field.swiftType.hasSuffix("?") ? " = nil" : ""
-            let suffix = index == model.fields.count - 1 ? "" : ","
-            return "\(bodyIndent)\(field.propertyName): \(field.swiftType)\(defaultValue)\(suffix)"
+        output += parameters.enumerated().map { index, parameter in
+            let suffix = index == parameters.count - 1 ? "" : ","
+            return "\(bodyIndent)\(parameter.name): \(parameter.type)\(parameter.defaultValue)\(suffix)"
         }.joined(separator: "\n")
         output += "\n\(baseIndent)) {\n"
-        for field in model.fields {
-            output += "\(bodyIndent)self.\(field.propertyName) = \(field.propertyName)\n"
+        for parameter in parameters {
+            output += "\(bodyIndent)self.\(parameter.name) = \(parameter.name)\n"
         }
         output += "\(baseIndent)}\n"
         return output
@@ -267,6 +293,67 @@ struct SwiftCodeGenerator: Sendable {
                 output += "\(caseIndent)case \(field.propertyName) = \"\(field.responseName)\"\n"
             }
         }
+        output += "\(baseIndent)}\n"
+        return output
+    }
+
+    private func renderConditionalCodable(for model: GeneratedSelectionSet, indent: Int) -> String {
+        let baseIndent = String(repeating: " ", count: indent)
+        let bodyIndent = String(repeating: " ", count: indent + 2)
+        let nestedIndent = String(repeating: " ", count: indent + 4)
+        var output = "\(baseIndent)public init(from decoder: Decoder) throws {\n"
+        if !model.fields.isEmpty {
+            output += "\(bodyIndent)let container = try decoder.container(keyedBy: CodingKeys.self)\n"
+            for field in model.fields {
+                if field.swiftType.hasSuffix("?") {
+                    output += "\(bodyIndent)self.\(field.propertyName) = try container.decodeIfPresent(\(field.swiftType.dropLast()).self, forKey: .\(field.propertyName))\n"
+                } else {
+                    output += "\(bodyIndent)self.\(field.propertyName) = try container.decode(\(field.swiftType).self, forKey: .\(field.propertyName))\n"
+                }
+            }
+        }
+        output += "\(bodyIndent)let typenameContainer = try? decoder.container(keyedBy: GraphQLResponseCodingKey.self)\n"
+        output += "\(bodyIndent)let typename = try? typenameContainer?.decode(String.self, forKey: GraphQLResponseCodingKey(\"__typename\"))\n"
+        for inlineFragment in model.inlineFragments {
+            output += "\(bodyIndent)if typename.map({ \(renderTypenameMatcher(inlineFragment.matchingTypenames)) }) ?? true {\n"
+            output += "\(nestedIndent)self.\(inlineFragment.propertyName) = try? \(inlineFragment.model.name)(from: decoder)\n"
+            output += "\(bodyIndent)} else {\n"
+            output += "\(nestedIndent)self.\(inlineFragment.propertyName) = nil\n"
+            output += "\(bodyIndent)}\n"
+        }
+        output += "\(baseIndent)}\n\n"
+        output += "\(baseIndent)public func encode(to encoder: Encoder) throws {\n"
+        if !model.fields.isEmpty {
+            output += "\(bodyIndent)var container = encoder.container(keyedBy: CodingKeys.self)\n"
+            for field in model.fields {
+                if field.swiftType.hasSuffix("?") {
+                    output += "\(bodyIndent)try container.encodeIfPresent(\(field.propertyName), forKey: .\(field.propertyName))\n"
+                } else {
+                    output += "\(bodyIndent)try container.encode(\(field.propertyName), forKey: .\(field.propertyName))\n"
+                }
+            }
+        }
+        for inlineFragment in model.inlineFragments {
+            output += "\(bodyIndent)try \(inlineFragment.propertyName)?.encode(to: encoder)\n"
+        }
+        output += "\(baseIndent)}\n"
+        return output
+    }
+
+    private func renderLocalCacheMutation(operationStructName: String, indent: Int) -> String {
+        let baseIndent = String(repeating: " ", count: indent)
+        let bodyIndent = String(repeating: " ", count: indent + 2)
+        var output = "\(baseIndent)public struct LocalCacheMutation: GraphQLLocalCacheMutation {\n"
+        output += "\(bodyIndent)public typealias TargetOperation = \(operationStructName)\n"
+        output += "\(bodyIndent)public var targetOperation: \(operationStructName)\n"
+        output += "\(bodyIndent)public var data: \(operationStructName).Data\n\n"
+        output += "\(bodyIndent)public init(targetOperation: \(operationStructName), data: \(operationStructName).Data) {\n"
+        output += "\(bodyIndent)  self.targetOperation = targetOperation\n"
+        output += "\(bodyIndent)  self.data = data\n"
+        output += "\(bodyIndent)}\n"
+        output += "\(baseIndent)}\n\n"
+        output += "\(baseIndent)public func localCacheMutation(data: \(operationStructName).Data) -> LocalCacheMutation {\n"
+        output += "\(bodyIndent)LocalCacheMutation(targetOperation: self, data: data)\n"
         output += "\(baseIndent)}\n"
         return output
     }
@@ -311,12 +398,12 @@ struct SwiftCodeGenerator: Sendable {
         var nestedSelectionSets: [GeneratedSelectionSet] = []
 
         for field in expanded.fields {
-            let graphQLType = schema.objects[parentGraphQLType]?.fields[field.name]?.type
+            let graphQLType = fieldType(named: field.name, parentGraphQLType: parentGraphQLType, schema: schema)
             let effectiveType = graphQLType ?? (field.name == "__typename" ? .nonNull(.named("String")) : .named("AWSJSON"))
             let fieldParentType = effectiveType.namedType
             let nestedName = swiftSelectionSetName(for: field.responseName, type: effectiveType)
-            let hasNestedObject = !field.selections.isEmpty && schema.objects[fieldParentType] != nil
-            if hasNestedObject {
+            let hasNestedComposite = !field.selections.isEmpty && isCompositeType(fieldParentType, schema: schema)
+            if hasNestedComposite {
                 nestedSelectionSets.append(try buildSelectionSet(
                     name: nestedName,
                     parentGraphQLType: fieldParentType,
@@ -331,18 +418,36 @@ struct SwiftCodeGenerator: Sendable {
                 propertyName: escapedIdentifier(swiftPropertyName(field.responseName)),
                 swiftType: swiftOutputType(
                     effectiveType,
-                    nestedTypeName: hasNestedObject ? nestedName : nil,
+                    nestedTypeName: hasNestedComposite ? nestedName : nil,
                     schema: schema,
                     scalarMappings: scalarMappings
                 )
             ))
         }
 
+        let inlineFragments = try expanded.inlineFragments.map { inlineFragment in
+            let model = try buildSelectionSet(
+                name: "As\(swiftTypeName(inlineFragment.typeName))",
+                parentGraphQLType: inlineFragment.typeName,
+                selections: inlineFragment.selections,
+                fragments: fragments,
+                schema: schema,
+                scalarMappings: scalarMappings
+            )
+            return GeneratedInlineFragment(
+                typeName: inlineFragment.typeName,
+                propertyName: escapedIdentifier("as\(swiftTypeName(inlineFragment.typeName))"),
+                matchingTypenames: matchingTypenames(for: inlineFragment.typeName, schema: schema),
+                model: model
+            )
+        }
+
         return GeneratedSelectionSet(
             name: name,
             fields: generatedFields,
             fragmentSpreads: expanded.fragmentSpreads.map(swiftTypeName).sorted(),
-            nestedSelectionSets: nestedSelectionSets
+            nestedSelectionSets: nestedSelectionSets,
+            inlineFragments: inlineFragments
         )
     }
 
@@ -356,6 +461,7 @@ struct SwiftCodeGenerator: Sendable {
         var fields: [MergedField] = []
         var fieldIndexes: [String: Int] = [:]
         var fragmentSpreads: [String] = []
+        var inlineFragments: [ConditionalSelection] = []
 
         func merge(_ field: MergedField) {
             if let existingIndex = fieldIndexes[field.responseName] {
@@ -372,8 +478,12 @@ struct SwiftCodeGenerator: Sendable {
                 merge(MergedField(name: field.name, responseName: field.responseName, selections: field.selections))
             case .fragmentSpread(let name):
                 guard let fragment = fragments[name], !visitedFragments.contains(name) else { continue }
-                fragmentSpreads.append(name)
                 let selectionSet = try GraphQLSelectionParser.parseSelectionSet(in: fragment.source)
+                if shouldKeepConditionalSelection(typeName: fragment.typeName, parentGraphQLType: parentGraphQLType, schema: schema) {
+                    inlineFragments.append(ConditionalSelection(typeName: fragment.typeName, selections: selectionSet.selections))
+                    continue
+                }
+                fragmentSpreads.append(name)
                 var visited = visitedFragments
                 visited.insert(name)
                 let expanded = try expandSelections(
@@ -386,7 +496,13 @@ struct SwiftCodeGenerator: Sendable {
                 for field in expanded.fields {
                     merge(field)
                 }
+                inlineFragments.append(contentsOf: expanded.inlineFragments)
             case .inlineFragment(let typeName, let nestedSelections):
+                if let typeName,
+                   shouldKeepConditionalSelection(typeName: typeName, parentGraphQLType: parentGraphQLType, schema: schema) {
+                    inlineFragments.append(ConditionalSelection(typeName: typeName, selections: nestedSelections))
+                    continue
+                }
                 let expanded = try expandSelections(
                     nestedSelections,
                     parentGraphQLType: typeName ?? parentGraphQLType,
@@ -397,12 +513,23 @@ struct SwiftCodeGenerator: Sendable {
                 for field in expanded.fields {
                     merge(field)
                 }
+                inlineFragments.append(contentsOf: expanded.inlineFragments)
+            }
+        }
+
+        let mergedInlineFragments = inlineFragments.reduce(into: [String: ConditionalSelection]()) { partial, selection in
+            if var existing = partial[selection.typeName] {
+                existing.selections.append(contentsOf: selection.selections)
+                partial[selection.typeName] = existing
+            } else {
+                partial[selection.typeName] = selection
             }
         }
 
         return ExpandedSelections(
             fields: fields,
-            fragmentSpreads: Array(Set(fragmentSpreads)).sorted()
+            fragmentSpreads: Array(Set(fragmentSpreads)).sorted(),
+            inlineFragments: mergedInlineFragments.values.sorted { $0.typeName < $1.typeName }
         )
     }
 
@@ -426,7 +553,7 @@ struct SwiftCodeGenerator: Sendable {
     ) -> String {
         switch type {
         case .named(let name):
-            if schema.objects[name] != nil, let nestedTypeName {
+            if isCompositeType(name, schema: schema), let nestedTypeName {
                 return nestedTypeName
             }
             if schema.enums[name] != nil {
@@ -481,12 +608,64 @@ struct SwiftCodeGenerator: Sendable {
         return sources.joined(separator: "\n\n")
     }
 
-    private func rootTypeName(for kind: GraphQLOperationDefinition.Kind) -> String {
+    private func rootTypeName(for kind: GraphQLOperationDefinition.Kind, schema: GraphQLSchema) -> String {
         switch kind {
-        case .query: return "Query"
-        case .mutation: return "Mutation"
-        case .subscription: return "Subscription"
+        case .query: return schema.queryTypeName
+        case .mutation: return schema.mutationTypeName
+        case .subscription: return schema.subscriptionTypeName
         }
+    }
+
+    private func fieldType(
+        named fieldName: String,
+        parentGraphQLType: String,
+        schema: GraphQLSchema
+    ) -> GraphQLTypeReference? {
+        if fieldName == "__typename" {
+            return .nonNull(.named("String"))
+        }
+        if let field = schema.objects[parentGraphQLType]?.fields[fieldName] {
+            return field.type
+        }
+        if let field = schema.interfaces[parentGraphQLType]?.fields[fieldName] {
+            return field.type
+        }
+        return nil
+    }
+
+    private func isCompositeType(_ typeName: String, schema: GraphQLSchema) -> Bool {
+        schema.objects[typeName] != nil || schema.interfaces[typeName] != nil || schema.unions[typeName] != nil
+    }
+
+    private func shouldKeepConditionalSelection(
+        typeName: String,
+        parentGraphQLType: String,
+        schema: GraphQLSchema
+    ) -> Bool {
+        guard typeName != parentGraphQLType else { return false }
+        if schema.unions[parentGraphQLType] != nil || schema.interfaces[parentGraphQLType] != nil {
+            return true
+        }
+        return false
+    }
+
+    private func matchingTypenames(for typeName: String, schema: GraphQLSchema) -> [String] {
+        if let union = schema.unions[typeName] {
+            return union.possibleTypes.sorted()
+        }
+        if schema.interfaces[typeName] != nil {
+            let implementors = schema.objects.values
+                .filter { $0.interfaces.contains(typeName) }
+                .map(\.name)
+                .sorted()
+            return Array(Set(implementors + [typeName])).sorted()
+        }
+        return [typeName]
+    }
+
+    private func renderTypenameMatcher(_ typenames: [String]) -> String {
+        let values = typenames.map(swiftStringLiteral).joined(separator: ", ")
+        return "[\(values)].contains($0)"
     }
 
     private func operationStructName(_ operation: GraphQLOperationDefinition) -> String {
@@ -706,6 +885,7 @@ private struct GeneratedSelectionSet {
     var fields: [GeneratedField]
     var fragmentSpreads: [String]
     var nestedSelectionSets: [GeneratedSelectionSet]
+    var inlineFragments: [GeneratedInlineFragment]
 }
 
 private struct GeneratedField {
@@ -714,15 +894,28 @@ private struct GeneratedField {
     var swiftType: String
 }
 
+private struct GeneratedInlineFragment {
+    var typeName: String
+    var propertyName: String
+    var matchingTypenames: [String]
+    var model: GeneratedSelectionSet
+}
+
 private struct MergedField {
     var name: String
     var responseName: String
     var selections: [GraphQLSelection]
 }
 
+private struct ConditionalSelection {
+    var typeName: String
+    var selections: [GraphQLSelection]
+}
+
 private struct ExpandedSelections {
     var fields: [MergedField]
     var fragmentSpreads: [String]
+    var inlineFragments: [ConditionalSelection]
 }
 
 private extension GraphQLTypeReference {

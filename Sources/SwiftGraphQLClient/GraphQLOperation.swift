@@ -17,6 +17,14 @@ public protocol GraphQLQuery: GraphQLOperation {}
 public protocol GraphQLMutation: GraphQLOperation {}
 public protocol GraphQLSubscription: GraphQLOperation {}
 
+public protocol GraphQLLocalCacheMutation: Sendable {
+    associatedtype Data: Encodable & Sendable
+    associatedtype TargetOperation: GraphQLOperation where TargetOperation.Data == Data
+
+    var targetOperation: TargetOperation { get }
+    var data: Data { get }
+}
+
 public struct EmptyGraphQLVariables: Encodable, Sendable, Equatable {
     public init() {}
 }
@@ -45,6 +53,25 @@ public indirect enum GraphQLSelection: Sendable, Equatable, Codable {
     case field(name: String, responseName: String, selections: [GraphQLSelection])
     case fragmentSpread(String)
     case inlineFragment(typeName: String?, selections: [GraphQLSelection])
+}
+
+public struct GraphQLResponseCodingKey: CodingKey, Sendable {
+    public var stringValue: String
+    public var intValue: Int?
+
+    public init(_ stringValue: String) {
+        self.stringValue = stringValue
+        self.intValue = nil
+    }
+
+    public init?(stringValue: String) {
+        self.init(stringValue)
+    }
+
+    public init?(intValue: Int) {
+        self.stringValue = String(intValue)
+        self.intValue = intValue
+    }
 }
 
 public extension GraphQLOperation {

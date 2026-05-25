@@ -41,6 +41,31 @@ enum SwiftGraphQLCodegenCLI {
                 fputs("\(error.localizedDescription)\n", stderr)
                 return 1
             }
+        case "publish-operation-manifest":
+            guard let manifestPath = value(after: "--manifest", in: arguments) else {
+                fputs("Missing --manifest path.\n", stderr)
+                return 64
+            }
+            guard let endpoint = value(after: "--endpoint", in: arguments) else {
+                fputs("Missing --endpoint URL.\n", stderr)
+                return 64
+            }
+            do {
+                guard let endpointURL = URL(string: endpoint) else {
+                    throw CodegenError.invalidConfiguration("Invalid --endpoint URL.")
+                }
+                let headers = try parseHeaders(values(after: "--header", in: arguments))
+                let statusCode = try CodegenRunner.publishOperationManifest(
+                    manifestURL: URL(fileURLWithPath: manifestPath),
+                    endpointURL: endpointURL,
+                    headers: headers
+                )
+                print("Published operation manifest with HTTP \(statusCode)")
+                return 0
+            } catch {
+                fputs("\(error.localizedDescription)\n", stderr)
+                return 1
+            }
         case "introspect":
             guard let endpoint = value(after: "--endpoint", in: arguments) else {
                 fputs("Missing --endpoint URL.\n", stderr)
@@ -87,6 +112,7 @@ enum SwiftGraphQLCodegenCLI {
           swift-graphql introspect --endpoint URL [--header "Name: Value"] --output schema.graphqls
           swift-graphql generate --config swift-graphql-codegen.yml [--output GeneratedGraphQL]
           swift-graphql generate-operation-manifest --config swift-graphql-codegen.yml [--output operation-manifest.json]
+          swift-graphql publish-operation-manifest --manifest operation-manifest.json --endpoint URL [--header "Name: Value"]
 
         The swift-graphql-codegen executable remains available as a compatibility alias.
         """)

@@ -75,6 +75,19 @@ public enum CodegenRunner {
         return outputURL
     }
 
+    @discardableResult
+    public static func publishOperationManifest(
+        manifestURL: URL,
+        endpointURL: URL,
+        headers: [String: String] = [:]
+    ) throws -> Int {
+        try OperationManifestPublisher.publish(
+            manifestURL: manifestURL,
+            endpointURL: endpointURL,
+            headers: headers
+        )
+    }
+
     private static func documentSource(
         for operation: GraphQLOperationDefinition,
         fragments: [String: GraphQLFragmentDefinition]
@@ -91,6 +104,55 @@ public enum CodegenRunner {
         }
         appendFragments(operation.fragmentSpreads)
         return sources.joined(separator: "\n\n")
+    }
+}
+
+public enum OperationManifestPublisher {
+    public static func request(
+        manifestData: Data,
+        endpointURL: URL,
+        headers: [String: String] = [:]
+    ) -> URLRequest {
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        for (name, value) in headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.httpBody = manifestData
+        return request
+    }
+
+    @discardableResult
+    public static func publish(
+        manifestURL: URL,
+        endpointURL: URL,
+        headers: [String: String] = [:]
+    ) throws -> Int {
+        let manifestData = try Data(contentsOf: manifestURL)
+        let request = request(manifestData: manifestData, endpointURL: endpointURL, headers: headers)
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<Int, Error>?
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+            if let error {
+                result = .failure(error)
+                return
+            }
+            guard let httpResponse = response as? HTTPURLResponse else {
+                result = .failure(CodegenError.invalidConfiguration("Operation manifest endpoint returned an invalid response."))
+                return
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                let body = data.map { String(decoding: $0, as: UTF8.self) } ?? ""
+                result = .failure(CodegenError.invalidConfiguration("Operation manifest endpoint returned HTTP \(httpResponse.statusCode). \(body)"))
+                return
+            }
+            result = .success(httpResponse.statusCode)
+        }.resume()
+        semaphore.wait()
+        return try result?.get() ?? 0
     }
 }
 

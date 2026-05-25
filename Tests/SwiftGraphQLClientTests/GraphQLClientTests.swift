@@ -356,6 +356,63 @@ final class GraphQLClientTests: XCTestCase {
         XCTAssertEqual(values.last?.hasNext, false)
     }
 
+    func testFetchIncrementalMergedAppliesPatchesToTypedSnapshots() async throws {
+        let body = """
+        --graphql
+        Content-Type: application/json
+
+        {"data":{"viewer":{"id":"user-1","name":"Initial"}},"hasNext":true}
+        --graphql
+        Content-Type: application/json
+
+        {"incremental":[{"label":"MoreViewer","path":["viewer"],"data":{"nickname":"MJ"}}],"hasNext":false}
+        --graphql--
+        """
+        let session = RecordingSession { _ in
+            Self.response(
+                statusCode: 200,
+                body: body,
+                headers: ["Content-Type": "multipart/mixed; boundary=graphql"]
+            )
+        }
+        let client = GraphQLClient(
+            configuration: GraphQLClientConfiguration(endpointURL: URL(string: "https://example.com/graphql")!),
+            session: session
+        )
+
+        var values: [GraphQLIncrementalResult<MergedViewerQuery.Data>] = []
+        for try await value in client.fetchIncrementalMerged(MergedViewerQuery(id: "user-1")) {
+            values.append(value)
+        }
+
+        XCTAssertEqual(values.count, 2)
+        XCTAssertNil(values.first?.data?.viewer.nickname)
+        XCTAssertEqual(values.last?.data?.viewer.nickname, "MJ")
+    }
+
+    func testIncrementalPatchMergerAppliesStreamItems() throws {
+        var base: GraphQLJSONValue = .object([
+            "viewer": .object([
+                "messages": .array([.object(["text": .string("one")])])
+            ])
+        ])
+        let patch = GraphQLIncrementalPatch(
+            path: [.string("viewer"), .string("messages"), .int(1)],
+            items: [.object(["text": .string("two")])]
+        )
+
+        try GraphQLIncrementalPatchMerger.apply(patch, to: &base)
+
+        XCTAssertEqual(base, .object([
+            "viewer": .object([
+                "messages": .array([
+                    .object(["text": .string("one")]),
+                    .object(["text": .string("two")])
+                ])
+            ])
+        ]))
+    }
+
     func testHTTPSubscriptionTransportParsesMultipartResponses() async throws {
         let body = """
         --graphql
@@ -417,6 +474,31 @@ private struct ViewerQuery: GraphQLQuery {
         struct Viewer: Decodable, Sendable, Equatable {
             let id: String
             let name: String
+        }
+
+        let viewer: Viewer
+    }
+
+    let id: GraphQLID
+
+    var variables: Variables {
+        Variables(id: id)
+    }
+}
+
+private struct MergedViewerQuery: GraphQLQuery {
+    static let operationName = "MergedViewer"
+    static let document = "query MergedViewer($id: ID!) { viewer(id: $id) { id name nickname } }"
+
+    struct Variables: Encodable, Sendable {
+        let id: GraphQLID
+    }
+
+    struct Data: Decodable, Sendable, Equatable {
+        struct Viewer: Decodable, Sendable, Equatable {
+            let id: String
+            let name: String
+            let nickname: String?
         }
 
         let viewer: Viewer

@@ -198,6 +198,23 @@ final class GraphQLCacheTests: XCTestCase {
 
         XCTAssertEqual(value, 2)
     }
+
+    func testOperationCacheStoreWritesLocalCacheMutation() async throws {
+        let cache = GraphQLNormalizedCache()
+        let store = GraphQLOperationCacheStore(cache: cache)
+        let query = CounterQuery()
+
+        try await store.withinReadWriteTransaction { transaction in
+            try await transaction.write(CounterLocalCacheMutation(
+                targetOperation: query,
+                data: CounterQuery.Data(counter: .init(value: 42))
+            ))
+        }
+
+        let response = try await cache.read(query)
+        XCTAssertFalse(response.isPartial)
+        XCTAssertEqual(response.data, .object(["counter": .object(["value": .int(42)])]))
+    }
 }
 
 private struct CacheViewerQuery: GraphQLQuery {
@@ -270,4 +287,9 @@ private struct CounterQuery: GraphQLQuery {
 
         var counter: Counter
     }
+}
+
+private struct CounterLocalCacheMutation: GraphQLLocalCacheMutation {
+    var targetOperation: CounterQuery
+    var data: CounterQuery.Data
 }

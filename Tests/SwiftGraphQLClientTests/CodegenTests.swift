@@ -131,6 +131,98 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(manifest.contains("fragment MessageName on Message"))
     }
 
+    func testGenerateModelsAbstractTypeInlineFragmentsAndLocalCacheMutations() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftGraphQLCodegenAbstractTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let schemaURL = root.appendingPathComponent("schema.graphqls")
+        let operationsDirectory = root.appendingPathComponent("Operations")
+        try FileManager.default.createDirectory(at: operationsDirectory, withIntermediateDirectories: true)
+        try """
+        schema {
+          query: RootQuery
+        }
+        interface Node {
+          id: ID!
+        }
+        type User implements Node {
+          id: ID!
+          name: String!
+        }
+        type Message implements Node {
+          id: ID!
+          text: String!
+        }
+        union SearchResult = User | Message
+        type RootQuery {
+          search: [SearchResult!]!
+          node: Node
+        }
+        """.write(to: schemaURL, atomically: true, encoding: .utf8)
+
+        try """
+        query Search {
+          search {
+            __typename
+            ... on User {
+              id
+              name
+            }
+            ... on Message {
+              id
+              text
+            }
+          }
+          node {
+            __typename
+            id
+            ... on User {
+              name
+            }
+          }
+        }
+        """.write(to: operationsDirectory.appendingPathComponent("Search.graphql"), atomically: true, encoding: .utf8)
+
+        let configURL = root.appendingPathComponent("swift-graphql-codegen.yml")
+        try """
+        namespace: SearchAPI
+        schema:
+          - schema.graphqls
+        operations:
+          - Operations/**/*.graphql
+        output: GeneratedGraphQL
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let outputURL = try CodegenRunner.generate(configURL: configURL)
+        let output = try String(contentsOf: outputURL)
+
+        XCTAssertTrue(output.contains("struct SearchQuery: GraphQLQuery"))
+        XCTAssertTrue(output.contains("public var asUser: AsUser?"))
+        XCTAssertTrue(output.contains("public var asMessage: AsMessage?"))
+        XCTAssertTrue(output.contains("GraphQLResponseCodingKey(\"__typename\")"))
+        XCTAssertTrue(output.contains(#"["Message"].contains($0)"#))
+        XCTAssertTrue(output.contains(#"["User"].contains($0)"#))
+        XCTAssertTrue(output.contains("public struct LocalCacheMutation: GraphQLLocalCacheMutation"))
+        XCTAssertTrue(output.contains("public func localCacheMutation(data: SearchQuery.Data) -> LocalCacheMutation"))
+    }
+
+    func testOperationManifestPublisherBuildsJSONPostRequest() throws {
+        let manifest = Data(#"{"format":"apollo-persisted-query-manifest"}"#.utf8)
+        let request = OperationManifestPublisher.request(
+            manifestData: manifest,
+            endpointURL: URL(string: "https://example.com/pql")!,
+            headers: ["Authorization": "Bearer token"]
+        )
+
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+        XCTAssertEqual(request.httpBody, manifest)
+    }
+
     func testIntrospectionJSONPrintsSDL() throws {
         let fixture = """
         {

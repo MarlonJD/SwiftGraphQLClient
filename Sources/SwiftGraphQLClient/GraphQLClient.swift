@@ -117,7 +117,26 @@ public final class GraphQLClient: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             Task {
                 do {
-                    let results = try await executeIncremental(query)
+                    let results = try await executeIncremental(query, mergesPatches: false, writesToCache: false)
+                    for result in results {
+                        continuation.yield(result)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func fetchIncrementalMerged<Query: GraphQLQuery>(
+        _ query: Query,
+        writesToCache: Bool = true
+    ) -> AsyncThrowingStream<GraphQLIncrementalResult<Query.Data>, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let results = try await executeIncremental(query, mergesPatches: true, writesToCache: writesToCache)
                     for result in results {
                         continuation.yield(result)
                     }
@@ -245,8 +264,59 @@ public final class GraphQLClient: @unchecked Sendable {
     }
 
     private func executeIncremental<Operation: GraphQLOperation>(
-        _ operation: Operation
+        _ operation: Operation,
+        mergesPatches: Bool,
+        writesToCache: Bool
     ) async throws -> [GraphQLIncrementalResult<Operation.Data>] {
+        let rawResults = try await executeIncrementalRaw(operation)
+        guard mergesPatches else {
+            return try rawResults.map { rawResult in
+                let typedData = try rawResult.data.map {
+                    try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
+                }
+                return GraphQLIncrementalResult(
+                    data: typedData,
+                    errors: rawResult.errors,
+                    patches: rawResult.patches,
+                    hasNext: rawResult.hasNext
+                )
+            }
+        }
+
+        var currentData: GraphQLJSONValue?
+        var mergedResults: [GraphQLIncrementalResult<Operation.Data>] = []
+        for rawResult in rawResults {
+            if let data = rawResult.data {
+                currentData = data
+            }
+            if !rawResult.patches.isEmpty {
+                currentData = try GraphQLIncrementalPatchMerger.applying(
+                    patches: rawResult.patches,
+                    to: currentData
+                )
+            }
+            let typedData = try currentData.map {
+                try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
+            }
+            if writesToCache,
+               rawResult.hasNext == false,
+               rawResult.errors.isEmpty,
+               let currentData {
+                try await configuration.responseCache?.write(operation, data: currentData)
+            }
+            mergedResults.append(GraphQLIncrementalResult(
+                data: typedData,
+                errors: rawResult.errors,
+                patches: rawResult.patches,
+                hasNext: rawResult.hasNext
+            ))
+        }
+        return mergedResults
+    }
+
+    private func executeIncrementalRaw<Operation: GraphQLOperation>(
+        _ operation: Operation
+    ) async throws -> [GraphQLRawIncrementalResult] {
         let documentMode = requestDocumentMode(didPersistedQueryRetry: false)
         let context = GraphQLRequestContext(
             operationName: Operation.operationName,
@@ -277,11 +347,8 @@ public final class GraphQLClient: @unchecked Sendable {
         )
         return try parts.map { part in
             let envelope = try decoder.decode(GraphQLRawResponseEnvelope.self, from: part)
-            let typedData = try envelope.data.map {
-                try GraphQLResponseMaterializer.decode(Operation.Data.self, from: $0, decoder: decoder)
-            }
-            return GraphQLIncrementalResult(
-                data: typedData,
+            return GraphQLRawIncrementalResult(
+                data: envelope.data,
                 errors: envelope.errors ?? [],
                 patches: envelope.incremental?.map(\.patch) ?? [],
                 hasNext: envelope.hasNext
@@ -417,6 +484,13 @@ public final class GraphQLClient: @unchecked Sendable {
 private struct GraphQLExecutionResult<Data: Sendable>: Sendable {
     let result: GraphQLResult<Data>
     let rawData: GraphQLJSONValue?
+}
+
+private struct GraphQLRawIncrementalResult: Sendable {
+    let data: GraphQLJSONValue?
+    let errors: [GraphQLError]
+    let patches: [GraphQLIncrementalPatch]
+    let hasNext: Bool?
 }
 
 private struct GraphQLRequestBody: Encodable {

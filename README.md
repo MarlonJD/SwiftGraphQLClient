@@ -2,9 +2,9 @@
 
 SwiftGraphQLClient is a SwiftPM GraphQL toolkit built as Kindred's typed GraphQL runtime and codegen stack.
 
-Current status: the Kindred replacement surface and the first Apollo iOS parity layers are in place and tested. The implemented surface covers the core HTTP client, GraphQL input/runtime types, auth headers, GraphQL error parsing, refresh retry coordination, normalized cache integration, multipart upload requests, subscription transports, HTTP multipart incremental delivery, APQ/persisted query requests, introspection SDL export, operation manifests, and native Swift operation generation.
+Current status: the Kindred replacement surface and the Apollo iOS parity layers are in place and tested. The implemented surface covers the core HTTP client, GraphQL input/runtime types, auth headers, GraphQL error parsing, refresh retry coordination, normalized cache integration, local cache mutations, multipart upload requests, subscription transports, HTTP multipart incremental delivery with typed patch merging, APQ/persisted query requests, introspection SDL export, operation manifests, and native Swift operation generation.
 
-The codegen CLI now has an MVP `generate` command. It can read the current YAML config or a legacy JSON config, parse schema scalars/enums/input objects/object fields plus operation and fragment selections, and emit operation structs, input objects, fragments, scalar aliases, and nested `Codable` response `Data` models under the configured namespace.
+The codegen CLI can read the current YAML config or a legacy JSON config, parse schema scalars/enums/input objects/object/interface/union fields plus operation and fragment selections, and emit operation structs, input objects, fragments, scalar aliases, abstract-type projections, local cache mutation helpers, and nested `Codable` response `Data` models under the configured namespace.
 
 ## Why Use This Package
 
@@ -70,6 +70,7 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 - Automatic persisted query and safelisted persisted query request modes, including operation SHA-256 identifiers and APQ fallback retry.
 - Request and response interceptor hooks for custom networking pipelines.
 - HTTP multipart response parsing for incremental `@defer`-style responses through `GraphQLClient.fetchIncremental`.
+- Incremental patch merging for `@defer`/`@stream` responses through `GraphQLClient.fetchIncrementalMerged`.
 - HTTP multipart subscription transport through `GraphQLHTTPSubscriptionTransport`.
 - Fragment projection helper for generated `.fragments.foo` accessors.
 - Standard `graphql-transport-ws` transports for connection init, subscribe, ping/pong, next/error/complete message decoding, reconnect, keepalive timeout, fresh auth headers per reconnect, generated subscription streams, and optional single-socket multiplexing via `GraphQLMultiplexedWebSocketClient`.
@@ -77,7 +78,9 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 - Introspection JSON to SDL conversion plus `swift-graphql-codegen introspect --endpoint ... --output ...`.
 - Codegen emits `Upload = GraphQLUpload` and imports `SwiftGraphQLUpload` when the schema declares `scalar Upload`.
 - Codegen supports scalar mappings via `scalars`, `scalarMappings`, or `customScalars` in `swift-graphql-codegen.yml`.
-- Codegen emits stable `operationIdentifier` values and can generate Apollo persisted-query-compatible operation manifests.
+- Codegen emits stable `operationIdentifier` values and can generate or publish Apollo persisted-query-compatible operation manifests.
+- Codegen models `interface` and `union` selections with optional `asType` projections for inline fragments and concrete fragment spreads.
+- Codegen emits per-operation `localCacheMutation(data:)` helpers for typed cache writes.
 - Codegen emits fragment selection metadata for cache partial-read detection through fragment spreads.
 - SwiftPM build tool plugin discovers `swift-graphql-codegen.yml`/`.yaml` in the target or package root and emits generated sources into the plugin work directory.
 
@@ -91,6 +94,7 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 - Optimistic layer write, eviction, rollback, and commit.
 - Programmatic cache key resolvers that take precedence over declarative/custom key fields.
 - ApolloStore-style `GraphQLOperationCacheStore.withinReadWriteTransaction` for typed read/write/update cache transactions.
+- Generated local cache mutations can be written through `GraphQLReadWriteTransaction.write(_:)`.
 - Cursor/list reference append with deduplication.
 - SQLite-backed record persistence with merge writes, partial-read detection, eviction, clear, batch transactions, and WAL mode.
 - `GraphQLNormalizedCache` bridges normalized records into `GraphQLClient` cache policies, stores entities by `__typename:id` by default, supports custom key fields, and falls back to stable response paths for unkeyed objects.
@@ -98,7 +102,9 @@ let stream = client.subscribe(KindredAPI.MessageCreatedSubscription(...))
 
 ## Kindred Migration Notes
 
-See [KindredGraphQLMigrationInventory.md](Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory and narrowed MVP order.
+See [KindredGraphQLMigrationInventory.md](Docs/KindredGraphQLMigrationInventory.md) for the Kindred GraphQL migration inventory.
+
+See [SwiftGraphQLClient-0.6.0-Plan.md](Docs/SwiftGraphQLClient-0.6.0-Plan.md) for the next production-hardening plan.
 
 Kindred smoke-test command used during development:
 
@@ -123,4 +129,13 @@ Operation manifest command:
 swift run swift-graphql generate-operation-manifest \
   --config swift-graphql-codegen.yml \
   --output operation-manifest.json
+```
+
+Operation manifest publish command:
+
+```sh
+swift run swift-graphql publish-operation-manifest \
+  --manifest operation-manifest.json \
+  --endpoint https://example.com/persisted-query-manifest \
+  --header "Authorization: Bearer TOKEN"
 ```

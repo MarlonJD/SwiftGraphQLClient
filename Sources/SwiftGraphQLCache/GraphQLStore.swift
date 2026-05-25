@@ -382,6 +382,12 @@ public final class GraphQLReadWriteTransaction: @unchecked Sendable {
         try await cache.write(operation, data: try jsonValue(from: data))
     }
 
+    public func write<Mutation: GraphQLLocalCacheMutation>(
+        _ mutation: Mutation
+    ) async throws {
+        try await cache.write(mutation.targetOperation, data: try jsonValue(from: mutation.data))
+    }
+
     public func update<Operation: GraphQLOperation>(
         _ operation: Operation,
         _ update: (inout Operation.Data) throws -> Void

@@ -5,6 +5,11 @@ struct GraphQLSchema: Sendable, Equatable {
     var enums: [String: GraphQLEnumDefinition] = [:]
     var inputObjects: [String: GraphQLInputObjectDefinition] = [:]
     var objects: [String: GraphQLObjectDefinition] = [:]
+    var interfaces: [String: GraphQLInterfaceDefinition] = [:]
+    var unions: [String: GraphQLUnionDefinition] = [:]
+    var queryTypeName = "Query"
+    var mutationTypeName = "Mutation"
+    var subscriptionTypeName = "Subscription"
 }
 
 struct GraphQLEnumDefinition: Sendable, Equatable {
@@ -25,6 +30,17 @@ struct GraphQLInputFieldDefinition: Sendable, Equatable {
 struct GraphQLObjectDefinition: Sendable, Equatable {
     var name: String
     var fields: [String: GraphQLFieldDefinition]
+    var interfaces: [String] = []
+}
+
+struct GraphQLInterfaceDefinition: Sendable, Equatable {
+    var name: String
+    var fields: [String: GraphQLFieldDefinition]
+}
+
+struct GraphQLUnionDefinition: Sendable, Equatable {
+    var name: String
+    var possibleTypes: [String]
 }
 
 struct GraphQLFieldDefinition: Sendable, Equatable {
@@ -95,12 +111,37 @@ enum GraphQLSchemaParser {
                 continue
             }
 
+            if let interfaceName = blockName(line: line, keyword: "interface") {
+                let (body, nextIndex) = collectBlock(lines: lines, startIndex: index)
+                let fields = try body.compactMap(parseObjectField)
+                schema.interfaces[interfaceName] = GraphQLInterfaceDefinition(
+                    name: interfaceName,
+                    fields: Dictionary(uniqueKeysWithValues: fields.map { ($0.name, $0) })
+                )
+                index = nextIndex
+                continue
+            }
+
+            if let union = parseUnion(line: line, lines: lines, startIndex: index) {
+                schema.unions[union.definition.name] = union.definition
+                index = union.nextIndex
+                continue
+            }
+
+            if line.hasPrefix("schema") {
+                let (body, nextIndex) = collectBlock(lines: lines, startIndex: index)
+                applyRootOperationTypes(body: body, schema: &schema)
+                index = nextIndex
+                continue
+            }
+
             if let objectName = blockName(line: line, keyword: "type") {
                 let (body, nextIndex) = collectBlock(lines: lines, startIndex: index)
                 let fields = try body.compactMap(parseObjectField)
                 schema.objects[objectName] = GraphQLObjectDefinition(
                     name: objectName,
-                    fields: Dictionary(uniqueKeysWithValues: fields.map { ($0.name, $0) })
+                    fields: Dictionary(uniqueKeysWithValues: fields.map { ($0.name, $0) }),
+                    interfaces: implementedInterfaces(in: line)
                 )
                 index = nextIndex
                 continue
@@ -161,6 +202,62 @@ enum GraphQLSchemaParser {
             index += 1
         }
         return (body, index)
+    }
+
+    private static func parseUnion(
+        line: String,
+        lines: [String],
+        startIndex: Int
+    ) -> (definition: GraphQLUnionDefinition, nextIndex: Int)? {
+        guard let unionName = blockName(line: line, keyword: "union") else { return nil }
+        var rawDefinition = line
+        var nextIndex = startIndex + 1
+        while !rawDefinition.contains("="), nextIndex < lines.count {
+            let nextLine = stripComment(lines[nextIndex]).trimmingCharacters(in: .whitespaces)
+            rawDefinition += " " + nextLine
+            nextIndex += 1
+        }
+        guard let equals = rawDefinition.firstIndex(of: "=") else {
+            return (GraphQLUnionDefinition(name: unionName, possibleTypes: []), nextIndex)
+        }
+        let possibleTypes = rawDefinition[rawDefinition.index(after: equals)...]
+            .split { $0 == "|" || $0.isWhitespace || $0 == "@" }
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        return (GraphQLUnionDefinition(name: unionName, possibleTypes: possibleTypes), nextIndex)
+    }
+
+    private static func implementedInterfaces(in line: String) -> [String] {
+        guard let implementsRange = line.range(of: " implements ") else { return [] }
+        let suffix = line[implementsRange.upperBound...]
+        let end = suffix.firstIndex { $0 == "{" || $0 == "@" } ?? suffix.endIndex
+        return suffix[..<end]
+            .split { $0 == "&" || $0.isWhitespace }
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private static func applyRootOperationTypes(body: [String], schema: inout GraphQLSchema) {
+        for rawLine in body {
+            let line = stripComment(rawLine).trimmingCharacters(in: .whitespaces)
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let operation = line[..<colon].trimmingCharacters(in: .whitespaces)
+            let typeName = line[line.index(after: colon)...]
+                .split { $0.isWhitespace || $0 == "@" }
+                .first
+                .map(String.init)
+            guard let typeName else { continue }
+            switch operation {
+            case "query":
+                schema.queryTypeName = typeName
+            case "mutation":
+                schema.mutationTypeName = typeName
+            case "subscription":
+                schema.subscriptionTypeName = typeName
+            default:
+                break
+            }
+        }
     }
 
     private static func enumCaseName(from line: String) -> String? {
